@@ -210,16 +210,24 @@ async fn main() {
         StoreBuilder::new(&logger, &node_id, &config, metrics_registry.cheap_clone()).await;
 
     let launch_services = |logger: Logger| async move {
-        let (eth_networks, idents) = connect_networks(&logger, eth_networks).await;
-
         let subscription_manager = store_builder.subscription_manager();
         let chain_head_update_listener = store_builder.chain_head_update_listener();
-        let network_store = store_builder.network_store(idents);
 
         // To support the ethereum block ingestor, ethereum networks are referenced both by the
         // `blockchain_map` and `ethereum_chains`. Future chains should be referred to only in
         // `blockchain_map`.
         let mut blockchain_map = BlockchainMap::new();
+
+        let (eth_networks, ethereum_idents) = connect_networks(&logger, eth_networks).await;
+        let near_idents = compute_near_network_identifiers(&firehose_networks);
+
+        let network_identifiers = ethereum_idents
+            .into_iter()
+            .chain(near_idents.into_iter())
+            .collect();
+
+        let network_store = store_builder.network_store(network_identifiers);
+
         let ethereum_chains = ethereum_networks_as_chains(
             &mut blockchain_map,
             &logger,
@@ -651,6 +659,34 @@ async fn connect_networks(
     (eth_networks, idents)
 }
 
+// FIXME (NEAR): This is quite wrong, will need a refactor to remove the need to have a `EthereumNetworkIdentifier`
+//               to create an actual `NetworkStore` (see `store_builder.network_store`).
+fn compute_near_network_identifiers(
+    firehose_networks: &FirehoseNetworks,
+) -> Vec<(String, Vec<EthereumNetworkIdentifier>)> {
+    firehose_networks
+        .flatten()
+        .into_iter()
+        .map(|(name, endpoint)| {
+            (
+                name,
+                EthereumNetworkIdentifier {
+                    genesis_block_hash: H256::from([0x00; 32]),
+                    net_version: endpoint.provider.clone(),
+                },
+            )
+        })
+        .fold(
+            HashMap::<String, Vec<EthereumNetworkIdentifier>>::new(),
+            |mut networks, (name, endpoint)| {
+                networks.entry(name.to_string()).or_default().push(endpoint);
+                networks
+            },
+        )
+        .into_iter()
+        .collect()
+}
+
 fn create_ipfs_clients(logger: &Logger, ipfs_addresses: &Vec<String>) -> Vec<IpfsClient> {
     // Parse the IPFS URL from the `--ipfs` command line argument
     let ipfs_addresses: Vec<_> = ipfs_addresses
@@ -744,7 +780,8 @@ fn ethereum_networks_as_chains(
                 .or_else(|| {
                     error!(
                         logger,
-                        "No store configured for chain {}; ignoring this chain", network_name
+                        "No store configured for Ethereum chain {}; ignoring this chain",
+                        network_name
                     );
                     None
                 })
@@ -798,14 +835,12 @@ fn near_networks_as_chains(
                 .or_else(|| {
                     error!(
                         logger,
-                        "No store configured for chain {}; ignoring this chain", network_name
+                        "No store configured for NEAR chain {}; ignoring this chain", network_name
                     );
                     None
                 })
         })
         .map(|(network_name, chain_store, firehose_endpoints)| {
-            let firehose_endpoints = firehose_networks.networks.get(network_name);
-
             (
                 network_name.clone(),
                 Arc::new(near::Chain::new(
@@ -814,8 +849,7 @@ fn near_networks_as_chains(
                     registry.clone(),
                     chain_store,
                     store.subgraph_store(),
-                    firehose_endpoints
-                        .map_or_else(|| FirehoseNetworkEndpoints::new(), |v| v.clone()),
+                    firehose_endpoints.clone(),
                 )),
             )
         })
