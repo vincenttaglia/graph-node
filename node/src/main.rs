@@ -7,6 +7,7 @@ use lazy_static::lazy_static;
 use std::io::{BufRead, BufReader};
 use std::path::Path;
 use std::str::FromStr;
+use std::sync::atomic;
 use std::time::Duration;
 use std::{collections::HashMap, env};
 use structopt::StructOpt;
@@ -112,6 +113,11 @@ async fn main() {
         "Graph Node version: {}",
         render_testament!(TESTAMENT)
     );
+
+    if opt.unsafe_config {
+        warn!(logger, "allowing unsafe configurations");
+        graph::env::UNSAFE_CONFIG.store(true, atomic::Ordering::SeqCst);
+    }
 
     let config = match Config::load(&logger, &opt.clone().into()) {
         Err(e) => {
@@ -853,6 +859,7 @@ mod test {
             ethereum_rpc: network_args,
             ethereum_ws: vec![],
             ethereum_ipc: vec![],
+            unsafe_config: false,
         };
 
         let config = Config::load(&logger, &opt).expect("can create config");
