@@ -30,12 +30,16 @@ You can replace this with anything else in `docker-compose.yaml`.
 After you have set up an Ethereum node—e.g. Ganache or Parity—simply
 clone this repository and do the following:
 
-Navigate to `graph-node/nginx` and edit `certbot.sh` to configure your domain and email, and run:
+Navigate to `graph-node/nginx` and edit `certbot.sh`.
+Configure your domain and email
+
+Then, run:
 
 ```sh
 sudo ./certbot.sh
 ```
-Make sure this was successful. If not, check your firewall rules.
+
+Make sure cert directory was created. If not, check your firewall rules.
 
 Edit `graph-node/nginx/conf.d/default.conf` and change `example.com` to your domain on the following lines:
 ```sh
@@ -47,7 +51,7 @@ ssl_certificate /etc/letsencrypt/live/example.com/fullchain.pem;
 ssl_certificate_key /etc/letsencrypt/live/example.com/privkey.pem;
 ```
 
-Now, you are ready to build the container in `/graph-node/docker`:
+Now, you are ready to build the container in `graph-node/docker`:
 
 ```sh
 sudo docker-compose up
@@ -59,9 +63,11 @@ can access these via:
 
 - Graph Node:
   - GraphiQL: `https://example.com/`
-  - HTTP: `https://example.com/subgraphs/name/<subgraph-name>`
+  - HTTP: `http://example.com/subgraphs/name/<subgraph-name>`
+  - HTTP: `http://example.com:8000/subgraphs/name/<subgraph-name>`
+  - HTTPS: `https://example.com/subgraphs/name/<subgraph-name>`
   - WebSockets: `ws://example.com:8001/subgraphs/name/<subgraph-name>`
-  - Admin: `http://localhost:8020/`
+  - Admin: `http://localhost:8020/` (Make sure to block admin port in your network firewall or it will be exposed on example.com as well)
 - IPFS:
   - `127.0.0.1:5001` or `/ip4/127.0.0.1/tcp/5001`
 - Postgres:
@@ -70,3 +76,4 @@ can access these via:
 Once this is up and running, you can use
 [`graph-cli`](https://github.com/graphprotocol/graph-cli) to create and
 deploy your subgraph to the running Graph Node.
+
