@@ -50,7 +50,7 @@ ssl_certificate_key /etc/letsencrypt/live/example.com/privkey.pem;
 Now, you are ready to build the container in `/graph-node/docker`:
 
 ```sh
-docker-compose up
+sudo docker-compose up
 ```
 
 This will start IPFS, Postgres, Graph Node, and Nginx in Docker and create persistent
