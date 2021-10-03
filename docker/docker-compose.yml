@@ -10,9 +10,9 @@ services:
     depends_on:
       - graph-node
     volumes:
-      - ../nginx/nginx.conf:/etc/nginx/nginx.conf
-      - ../nginx/conf.d:/etc/nginx/conf.d
-      - ../nginx/cert:/etc/letsencrypt:ro
+      - ./nginx/nginx.conf:/etc/nginx/nginx.conf
+      - ./nginx/conf.d:/etc/nginx/conf.d
+      - ./nginx/cert:/etc/letsencrypt:ro
   graph-node:
     image: graphprotocol/graph-node
     ports:
