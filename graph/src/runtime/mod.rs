@@ -3,6 +3,8 @@
 //! implementation. These methods take types that implement `To`/`FromAscObj` and are therefore
 //! convertible to/from an `AscType`.
 
+pub mod gas;
+
 mod asc_heap;
 mod asc_ptr;
 
@@ -14,6 +16,8 @@ use semver::Version;
 use std::convert::TryInto;
 use std::fmt;
 use std::mem::size_of;
+
+use self::gas::GasCounter;
 
 /// Marker trait for AssemblyScript types that the id should
 /// be in the header.
@@ -55,6 +59,7 @@ pub trait AscType: Sized {
     fn asc_size<H: AscHeap + ?Sized>(
         _ptr: AscPtr<Self>,
         _heap: &H,
+        _gas: &GasCounter,
     ) -> Result<u32, DeterministicHostError> {
         Ok(std::mem::size_of::<Self>() as u32)
     }
@@ -71,7 +76,7 @@ impl<T> AscType for std::marker::PhantomData<T> {
         asc_obj: &[u8],
         _api_version: &Version,
     ) -> Result<Self, DeterministicHostError> {
-        assert!(asc_obj.len() == 0);
+        assert!(asc_obj.is_empty());
 
         Ok(Self)
     }
@@ -92,7 +97,7 @@ impl AscType for bool {
         _api_version: &Version,
     ) -> Result<Self, DeterministicHostError> {
         if asc_obj.len() != 1 {
-            Err(DeterministicHostError(anyhow::anyhow!(
+            Err(DeterministicHostError::from(anyhow::anyhow!(
                 "Incorrect size for bool. Expected 1, got {},",
                 asc_obj.len()
             )))
@@ -115,7 +120,7 @@ macro_rules! impl_asc_type {
 
                 fn from_asc_bytes(asc_obj: &[u8], _api_version: &Version) -> Result<Self, DeterministicHostError> {
                     let bytes = asc_obj.try_into().map_err(|_| {
-                        DeterministicHostError(anyhow::anyhow!(
+                        DeterministicHostError::from(anyhow::anyhow!(
                             "Incorrect size for {}. Expected {}, got {},",
                             stringify!($T),
                             size_of::<Self>(),
@@ -134,12 +139,23 @@ macro_rules! impl_asc_type {
 
 impl_asc_type!(u8, u16, u32, u64, i8, i32, i64, f32, f64);
 
-// The numbers on each variant could just be comments hence the
-// `#[repr(u32)]`, however having them in code enforces each value
-// to be the same as the docs.
+/// Contains type IDs and their discriminants for every blockchain supported by Graph-Node.
+///
+/// Each variant corresponds to the unique ID of an AssemblyScript concrete class used in the
+/// [`runtime`].
+///
+/// # Rules for updating this enum
+///
+/// 1 .The discriminants must have the same value as their counterparts in `TypeId` enum from
+///    graph-ts' `global` module. If not, the runtime will fail to determine the correct class
+///    during allocation.
+/// 2. Each supported blockchain has a reserved space of 1,000 contiguous variants.
+/// 3. Once defined, items and their discriminants cannot be changed, as this would break running
+///    subgraphs compiled in previous versions of this representation.
 #[repr(u32)]
 #[derive(Copy, Clone, Debug)]
 pub enum IndexForAscTypeId {
+    // Ethereum type IDs
     String = 0,
     ArrayBuffer = 1,
     Int8Array = 2,
@@ -192,23 +208,172 @@ pub enum IndexForAscTypeId {
     ArrayF32 = 49,
     ArrayF64 = 50,
     ArrayBigDecimal = 51,
+
+    // Near Type IDs
+    NearArrayDataReceiver = 52,
+    NearArrayCryptoHash = 53,
+    NearArrayActionEnum = 54,
+    NearArrayMerklePathItem = 55,
+    NearArrayValidatorStake = 56,
+    NearArraySlashedValidator = 57,
+    NearArraySignature = 58,
+    NearArrayChunkHeader = 59,
+    NearAccessKeyPermissionEnum = 60,
+    NearActionEnum = 61,
+    NearDirectionEnum = 62,
+    NearPublicKey = 63,
+    NearSignature = 64,
+    NearFunctionCallPermission = 65,
+    NearFullAccessPermission = 66,
+    NearAccessKey = 67,
+    NearDataReceiver = 68,
+    NearCreateAccountAction = 69,
+    NearDeployContractAction = 70,
+    NearFunctionCallAction = 71,
+    NearTransferAction = 72,
+    NearStakeAction = 73,
+    NearAddKeyAction = 74,
+    NearDeleteKeyAction = 75,
+    NearDeleteAccountAction = 76,
+    NearActionReceipt = 77,
+    NearSuccessStatusEnum = 78,
+    NearMerklePathItem = 79,
+    NearExecutionOutcome = 80,
+    NearSlashedValidator = 81,
+    NearBlockHeader = 82,
+    NearValidatorStake = 83,
+    NearChunkHeader = 84,
+    NearBlock = 85,
+    NearReceiptWithOutcome = 86,
+    // Reserved discriminant space for more Near type IDs: [87, 999]:
+    // Continue to add more Near type IDs here.
+    // e.g.:
+    // NextNearType = 87,
+    // AnotherNearType = 88,
+    // ...
+    // LastNearType = 999,
+
+    // Reserved discriminant space for more Ethereum type IDs: [1000, 1499]
+    TransactionReceipt = 1000,
+    Log = 1001,
+    ArrayH256 = 1002,
+    ArrayLog = 1003,
+    // Continue to add more Ethereum type IDs here.
+    // e.g.:
+    // NextEthereumType = 1004,
+    // AnotherEthereumType = 1005,
+    // ...
+    // LastEthereumType = 1499,
+
+    // Reserved discriminant space for Tendermint type IDs: [1,500, 2,499]
+    TendermintArrayBytes = 1500,
+    TendermintArrayCommitSig = 1501,
+    TendermintArrayEvent = 1502,
+    TendermintArrayEventAttribute = 1503,
+    TendermintArrayEventTx = 1504,
+    TendermintArrayEvidence = 1505,
+    TendermintArrayValidator = 1506,
+    TendermintArrayValidatorUpdate = 1507,
+    TendermintBlock = 1508,
+    TendermintBlockID = 1509,
+    TendermintBlockIDFlagEnum = 1510,
+    TendermintBlockParams = 1511,
+    TendermintCommit = 1512,
+    TendermintCommitSig = 1513,
+    TendermintConsensus = 1514,
+    TendermintConsensusParams = 1515,
+    TendermintData = 1516,
+    TendermintDuplicateVoteEvidence = 1517,
+    TendermintDuration = 1518,
+    TendermintEvent = 1519,
+    TendermintEventAttribute = 1520,
+    TendermintEventBlock = 1521,
+    TendermintEventData = 1522,
+    TendermintEventList = 1523,
+    TendermintEventTx = 1524,
+    TendermintEventValidatorSetUpdates = 1525,
+    TendermintEventVote = 1526,
+    TendermintEvidence = 1527,
+    TendermintEvidenceList = 1528,
+    TendermintEvidenceParams = 1529,
+    TendermintHeader = 1530,
+    TendermintLightBlock = 1531,
+    TendermintLightClientAttackEvidence = 1532,
+    TendermintPartSetHeader = 1533,
+    TendermintPublicKey = 1534,
+    TendermintResponseBeginBlock = 1535,
+    TendermintResponseDeliverTx = 1536,
+    TendermintResponseEndBlock = 1537,
+    TendermintSignedHeader = 1538,
+    TendermintSignedMsgTypeEnum = 1539,
+    TendermintTimestamp = 1540,
+    TendermintTxResult = 1541,
+    TendermintValidator = 1542,
+    TendermintValidatorParams = 1543,
+    TendermintValidatorSet = 1544,
+    TendermintValidatorUpdate = 1545,
+    TendermintVersionParams = 1546,
+    // Continue to add more Tendermint type IDs here.
+    // e.g.:
+    // NextTendermintType = 1547,
+    // AnotherTendermintType = 1547,
+    // ...
+    // LastTendermintType = 2499,
+
+    // Reserved discriminant space for a future blockchain type IDs: [2,500, 3,499]
+    //
+    // Generated with the following shell script:
+    //
+    // ```
+    // grep -Po "(?<=IndexForAscTypeId::)IDENDIFIER_PREFIX.*\b" SRC_FILE | sort |uniq | awk 'BEGIN{count=2500} {sub("$", " = "count",", $1); count++} 1'
+    // ```
+    //
+    // INSTRUCTIONS:
+    // 1. Replace the IDENTIFIER_PREFIX and the SRC_FILE placeholders according to the blockchain
+    //    name and implementation before running this script.
+    // 2. Replace `2500` part with the first number of that blockchain's reserved discriminant space.
+    // 3. Insert the output right before the end of this block.
 }
 
 impl ToAscObj<u32> for IndexForAscTypeId {
     fn to_asc_obj<H: AscHeap + ?Sized>(
         &self,
         _heap: &mut H,
+        _gas: &GasCounter,
     ) -> Result<u32, DeterministicHostError> {
         Ok(*self as u32)
     }
 }
 
 #[derive(Debug)]
-pub struct DeterministicHostError(pub Error);
+pub enum DeterministicHostError {
+    Gas(Error),
+    Other(Error),
+}
+
+impl DeterministicHostError {
+    pub fn gas(e: Error) -> Self {
+        DeterministicHostError::Gas(e)
+    }
+
+    pub fn inner(self) -> Error {
+        match self {
+            DeterministicHostError::Gas(e) | DeterministicHostError::Other(e) => e,
+        }
+    }
+}
 
 impl fmt::Display for DeterministicHostError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        self.0.fmt(f)
+        match self {
+            DeterministicHostError::Gas(e) | DeterministicHostError::Other(e) => e.fmt(f),
+        }
+    }
+}
+
+impl From<Error> for DeterministicHostError {
+    fn from(e: Error) -> DeterministicHostError {
+        DeterministicHostError::Other(e)
     }
 }
 
@@ -234,7 +399,11 @@ impl From<anyhow::Error> for HostExportError {
 
 impl From<DeterministicHostError> for HostExportError {
     fn from(value: DeterministicHostError) -> Self {
-        HostExportError::Deterministic(value.0)
+        match value {
+            // Until we are confident on the gas numbers, gas errors are not deterministic
+            DeterministicHostError::Gas(e) => HostExportError::Unknown(e),
+            DeterministicHostError::Other(e) => HostExportError::Deterministic(e),
+        }
     }
 }
 

@@ -5,9 +5,8 @@
 use super::ProofOfIndexingEvent;
 use crate::{
     blockchain::BlockPtr,
-    prelude::{debug, BlockNumber, DeploymentHash, Logger},
+    prelude::{debug, BlockNumber, DeploymentHash, Logger, ENV_VARS},
 };
-use lazy_static::lazy_static;
 use stable_hash::crypto::{Blake3SeqNo, SetHasher};
 use stable_hash::prelude::*;
 use stable_hash::utils::AsBytes;
@@ -16,15 +15,9 @@ use std::convert::TryInto;
 use std::fmt;
 use web3::types::Address;
 
-lazy_static! {
-    static ref LOG_EVENTS: bool = std::env::var("GRAPH_LOG_POI_EVENTS")
-        .unwrap_or_else(|_| "false".into())
-        .parse::<bool>()
-        .expect("invalid GRAPH_LOG_POI_EVENTS");
-}
-
 pub struct BlockEventStream {
-    vec_length: usize,
+    vec_length: u64,
+    handler_start: u64,
     seq_no: Blake3SeqNo,
     digest: SetHasher,
 }
@@ -77,6 +70,7 @@ impl BlockEventStream {
         ]);
         Self {
             vec_length: 0,
+            handler_start: 0,
             seq_no: events,
             digest: SetHasher::new(),
         }
@@ -99,6 +93,10 @@ impl BlockEventStream {
     fn write(&mut self, event: &ProofOfIndexingEvent<'_>) {
         self.vec_length += 1;
         event.stable_hash(self.seq_no.next_child(), &mut self.digest);
+    }
+
+    fn start_handler(&mut self) {
+        self.handler_start = self.vec_length;
     }
 }
 
@@ -125,6 +123,18 @@ impl ProofOfIndexing {
             per_causality_region: HashMap::new(),
         }
     }
+
+    pub fn write_deterministic_error(&mut self, logger: &Logger, causality_region: &str) {
+        let redacted_events = self.with_causality_region(causality_region, |entry| {
+            entry.vec_length - entry.handler_start
+        });
+        self.write(
+            logger,
+            causality_region,
+            &ProofOfIndexingEvent::DeterministicError { redacted_events },
+        )
+    }
+
     /// Adds an event to the digest of the ProofOfIndexingStream local to the causality region
     pub fn write(
         &mut self,
@@ -132,7 +142,7 @@ impl ProofOfIndexing {
         causality_region: &str,
         event: &ProofOfIndexingEvent<'_>,
     ) {
-        if *LOG_EVENTS {
+        if ENV_VARS.log_poi_events {
             debug!(
                 logger,
                 "Proof of indexing event";
@@ -141,16 +151,29 @@ impl ProofOfIndexing {
             );
         }
 
-        // This may be better with the raw_entry API, once that is stabilized
+        self.with_causality_region(causality_region, |entry| entry.write(event))
+    }
+
+    pub fn start_handler(&mut self, causality_region: &str) {
+        self.with_causality_region(causality_region, |entry| entry.start_handler())
+    }
+
+    // This is just here because the raw_entry API is not stabilized.
+    fn with_causality_region<F, T>(&mut self, causality_region: &str, f: F) -> T
+    where
+        F: FnOnce(&mut BlockEventStream) -> T,
+    {
         if let Some(causality_region) = self.per_causality_region.get_mut(causality_region) {
-            causality_region.write(event);
+            f(causality_region)
         } else {
             let mut entry = BlockEventStream::new(self.block_number);
-            entry.write(event);
+            let result = f(&mut entry);
             self.per_causality_region
                 .insert(causality_region.to_owned(), entry);
+            result
         }
     }
+
     pub fn take(self) -> HashMap<String, BlockEventStream> {
         self.per_causality_region
     }

@@ -3,25 +3,13 @@ use futures::sync::mpsc;
 use futures03::stream::SplitStream;
 use graphql_parser::parse_query;
 use http::StatusCode;
-use lazy_static::lazy_static;
 use std::collections::HashMap;
-use std::env;
-use std::str::FromStr;
 use tokio::io::{AsyncRead, AsyncWrite};
 use tokio_tungstenite::tungstenite::{Error as WsError, Message as WsMessage};
 use tokio_tungstenite::WebSocketStream;
 use uuid::Uuid;
 
 use graph::{data::query::QueryTarget, prelude::*};
-
-lazy_static! {
-    static ref MAX_OPERATIONS_PER_CONNECTION: Option<usize> =
-        env::var("GRAPH_GRAPHQL_MAX_OPERATIONS_PER_CONNECTION")
-            .ok()
-            .map(|s| usize::from_str(&s).unwrap_or_else(|_| panic!(
-                "failed to parse env var GRAPH_GRAPHQL_MAX_OPERATIONS_PER_CONNECTION"
-            )));
-}
 
 #[derive(Debug, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -35,19 +23,28 @@ struct StartPayload {
 #[derive(Debug, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 enum IncomingMessage {
-    ConnectionInit { payload: Option<serde_json::Value> },
+    ConnectionInit {
+        #[allow(dead_code)]
+        payload: Option<serde_json::Value>,
+    },
     ConnectionTerminate,
-    Start { id: String, payload: StartPayload },
-    Stop { id: String },
+    Start {
+        id: String,
+        payload: StartPayload,
+    },
+    Stop {
+        id: String,
+    },
 }
 
 impl IncomingMessage {
     pub fn from_ws_message(msg: WsMessage) -> Result<Self, WsError> {
         let text = msg.into_text()?;
         serde_json::from_str(text.as_str()).map_err(|e| {
-            WsError::Http(http::Response::new(Some(
-                format!("Invalid GraphQL over WebSocket message: {}: {}", text, e).into(),
-            )))
+            WsError::Http(http::Response::new(Some(format!(
+                "Invalid GraphQL over WebSocket message: {}: {}",
+                text, e
+            ))))
         })
     }
 }
@@ -73,7 +70,7 @@ enum OutgoingMessage {
 impl OutgoingMessage {
     pub fn from_query_result(id: String, result: Arc<QueryResult>) -> Self {
         OutgoingMessage::Data {
-            id: id,
+            id,
             payload: result,
         }
     }
@@ -254,11 +251,11 @@ where
                         );
                     }
 
-                    if let Some(max_ops) = *MAX_OPERATIONS_PER_CONNECTION {
+                    if let Some(max_ops) = ENV_VARS.graphql.max_operations_per_connection {
                         if operations.operations.len() >= max_ops {
                             return send_error_string(
                                 &msg_sink,
-                                id.clone(),
+                                id,
                                 format!(
                                     "Reached the limit of {} operations per connection",
                                     max_ops
@@ -274,7 +271,7 @@ where
                         Err(e) => {
                             return send_error_string(
                                 &msg_sink,
-                                id.clone(),
+                                id,
                                 format!("Invalid query: {}: {}", payload.query, e),
                             );
                         }
@@ -289,7 +286,7 @@ where
                                 Err(e) => {
                                     return send_error_string(
                                         &msg_sink,
-                                        id.clone(),
+                                        id,
                                         format!("Invalid variables provided: {}", e),
                                     );
                                 }
@@ -298,7 +295,7 @@ where
                         _ => {
                             return send_error_string(
                                 &msg_sink,
-                                id.clone(),
+                                id,
                                 format!("Invalid variables provided (must be an object)"),
                             );
                         }

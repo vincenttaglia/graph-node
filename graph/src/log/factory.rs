@@ -1,9 +1,9 @@
-use std::time::Duration;
+use slog::*;
 
 use crate::components::store::DeploymentLocator;
 use crate::log::elastic::*;
 use crate::log::split::*;
-use slog::*;
+use crate::prelude::ENV_VARS;
 
 /// Configuration for component-specific logging to Elasticsearch.
 pub struct ElasticComponentLoggerConfig {
@@ -64,7 +64,8 @@ impl LoggerFactory {
                                     document_type: String::from("log"),
                                     custom_id_key: String::from("componentId"),
                                     custom_id_value: component.to_string(),
-                                    flush_interval: Duration::from_secs(5),
+                                    flush_interval: ENV_VARS.elastic_search_flush_interval,
+                                    max_retries: ENV_VARS.elastic_search_max_retries,
                                 },
                                 term_logger.clone(),
                             ),
@@ -93,7 +94,8 @@ impl LoggerFactory {
                             document_type: String::from("log"),
                             custom_id_key: String::from("subgraphId"),
                             custom_id_value: loc.hash.to_string(),
-                            flush_interval: Duration::from_secs(5),
+                            flush_interval: ENV_VARS.elastic_search_flush_interval,
+                            max_retries: ENV_VARS.elastic_search_max_retries,
                         },
                         term_logger.clone(),
                     ),

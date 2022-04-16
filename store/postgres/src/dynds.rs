@@ -60,7 +60,11 @@ fn to_source(
     })
 }
 
-pub fn load(conn: &PgConnection, id: &str) -> Result<Vec<StoredDynamicDataSource>, StoreError> {
+pub fn load(
+    conn: &PgConnection,
+    id: &str,
+    block: BlockNumber,
+) -> Result<Vec<StoredDynamicDataSource>, StoreError> {
     use dynamic_ethereum_contract_data_source as decds;
 
     // Query to load the data sources. Ordering by the creation block and `vid` makes sure they are
@@ -77,6 +81,7 @@ pub fn load(conn: &PgConnection, id: &str) -> Result<Vec<StoredDynamicDataSource
             decds::start_block,
             decds::ethereum_block_number,
         ))
+        .filter(decds::ethereum_block_number.le(sql(&format!("{}::numeric", block))))
         .order_by((decds::ethereum_block_number, decds::vid))
         .load::<(
             i64,
@@ -99,7 +104,7 @@ pub fn load(conn: &PgConnection, id: &str) -> Result<Vec<StoredDynamicDataSource
             creation_block,
         };
 
-        if !(data_sources.last().and_then(|d| d.creation_block) <= data_source.creation_block) {
+        if data_sources.last().and_then(|d| d.creation_block) > data_source.creation_block {
             return Err(StoreError::ConstraintViolation(
                 "data sources not ordered by creation block".to_string(),
             ));
@@ -113,7 +118,7 @@ pub fn load(conn: &PgConnection, id: &str) -> Result<Vec<StoredDynamicDataSource
 pub(crate) fn insert(
     conn: &PgConnection,
     deployment: &DeploymentHash,
-    data_sources: Vec<StoredDynamicDataSource>,
+    data_sources: &[StoredDynamicDataSource],
     block_ptr: &BlockPtr,
 ) -> Result<usize, StoreError> {
     use dynamic_ethereum_contract_data_source as decds;
@@ -152,7 +157,7 @@ pub(crate) fn insert(
                 decds::context.eq(context),
                 decds::address.eq(address),
                 decds::abi.eq(abi),
-                decds::start_block.eq(start_block as i32),
+                decds::start_block.eq(start_block),
                 decds::ethereum_block_number.eq(sql(&format!("{}::numeric", block_ptr.number))),
                 decds::ethereum_block_hash.eq(block_ptr.hash_slice()),
             ))

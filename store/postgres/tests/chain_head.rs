@@ -1,11 +1,13 @@
 //! Test ChainStore implementation of Store, in particular, how
 //! the chain head pointer gets updated in various situations
 
+use futures::executor;
 use std::future::Future;
 use std::sync::Arc;
 
 use graph::prelude::web3::types::H256;
 use graph::prelude::{anyhow::anyhow, anyhow::Error};
+use graph::prelude::{serde_json as json, EthereumBlock};
 use graph::prelude::{BlockNumber, QueryStoreManager};
 use graph::{cheap_clone::CheapClone, prelude::web3::types::H160};
 use graph::{components::store::BlockStore as _, prelude::DeploymentHash};
@@ -14,8 +16,9 @@ use graph_store_postgres::Store as DieselStore;
 use graph_store_postgres::{layout_for_tests::FAKE_NETWORK_SHARED, ChainStore as DieselChainStore};
 
 use test_store::block_store::{
-    Chain, FakeBlock, BLOCK_FIVE, BLOCK_FOUR, BLOCK_ONE, BLOCK_ONE_NO_PARENT, BLOCK_ONE_SIBLING,
-    BLOCK_THREE, BLOCK_THREE_NO_PARENT, BLOCK_TWO, BLOCK_TWO_NO_PARENT, GENESIS_BLOCK, NO_PARENT,
+    FakeBlock, FakeBlockList, BLOCK_FIVE, BLOCK_FOUR, BLOCK_ONE, BLOCK_ONE_NO_PARENT,
+    BLOCK_ONE_SIBLING, BLOCK_THREE, BLOCK_THREE_NO_PARENT, BLOCK_TWO, BLOCK_TWO_NO_PARENT,
+    GENESIS_BLOCK, NO_PARENT,
 };
 use test_store::*;
 
@@ -24,7 +27,7 @@ use test_store::*;
 const ANCESTOR_COUNT: BlockNumber = 3;
 
 /// Test harness for running database integration tests.
-fn run_test<F>(chain: Chain, test: F)
+fn run_test<F>(chain: FakeBlockList, test: F)
 where
     F: Fn(Arc<DieselChainStore>, Arc<DieselStore>) -> Result<(), Error> + Send + 'static,
 {
@@ -41,7 +44,7 @@ where
     });
 }
 
-fn run_test_async<R, F>(chain: Chain, test: F)
+fn run_test_async<R, F>(chain: FakeBlockList, test: F)
 where
     F: Fn(Arc<DieselChainStore>, Arc<DieselStore>) -> R + Send + Sync + 'static,
     R: Future<Output = ()> + Send + 'static,
@@ -64,7 +67,7 @@ where
 /// is the one indicated in `head_exp`. If `missing` is not `None`, check that
 /// `attempt_chain_head_update` reports that block as missing
 fn check_chain_head_update(
-    chain: Chain,
+    chain: FakeBlockList,
     head_exp: Option<&'static FakeBlock>,
     missing: Option<&'static str>,
 ) {
@@ -83,6 +86,7 @@ fn check_chain_head_update(
         let head_hash_exp = head_exp.map(|block| block.hash.clone());
         let head_hash_act = store
             .chain_head_ptr()
+            .await
             .expect("chain_head_ptr failed")
             .map(|ebp| ebp.hash_hex());
         assert_eq!(head_hash_exp, head_hash_act);
@@ -170,7 +174,7 @@ fn block_number() {
     run_test_async(chain, move |_, subgraph_store| {
         let subgraph = subgraph.cheap_clone();
         async move {
-            create_test_subgraph(&subgraph, "type Dummy @entity { id: ID! }");
+            create_test_subgraph(&subgraph, "type Dummy @entity { id: ID! }").await;
 
             let query_store = subgraph_store
                 .query_store(subgraph.cheap_clone().into(), false)
@@ -247,9 +251,14 @@ fn check_ancestor(
     offset: BlockNumber,
     exp: &FakeBlock,
 ) -> Result<(), Error> {
-    let act = store
-        .ancestor_block(child.block_ptr(), offset)?
-        .ok_or_else(|| anyhow!("block {} has no ancestor at offset {}", child.hash, offset))?;
+    let act = executor::block_on(
+        store
+            .cheap_clone()
+            .ancestor_block(child.block_ptr(), offset),
+    )?
+    .map(json::from_value::<EthereumBlock>)
+    .transpose()?
+    .ok_or_else(|| anyhow!("block {} has no ancestor at offset {}", child.hash, offset))?;
     let act_hash = format!("{:x}", act.block.hash.unwrap());
     let exp_hash = &exp.hash;
 
@@ -285,11 +294,15 @@ fn ancestor_block_simple() {
 
         for offset in [6, 7, 8, 50].iter() {
             let offset = *offset;
-            let res = store.ancestor_block(BLOCK_FIVE.block_ptr(), offset);
+            let res = executor::block_on(
+                store
+                    .cheap_clone()
+                    .ancestor_block(BLOCK_FIVE.block_ptr(), offset),
+            );
             assert!(res.is_err());
         }
 
-        let block = store.ancestor_block(BLOCK_TWO_NO_PARENT.block_ptr(), 1)?;
+        let block = executor::block_on(store.ancestor_block(BLOCK_TWO_NO_PARENT.block_ptr(), 1))?;
         assert!(block.is_none());
         Ok(())
     });

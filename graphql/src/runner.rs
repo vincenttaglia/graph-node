@@ -1,16 +1,17 @@
-use std::env;
-use std::str::FromStr;
+use std::collections::HashMap;
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::time::Instant;
 
 use crate::prelude::{QueryExecutionOptions, StoreResolver, SubscriptionExecutionOptions};
 use crate::query::execute_query;
 use crate::subscription::execute_prepared_subscription;
+use graph::prelude::MetricsRegistry;
+use graph::prometheus::{Gauge, Histogram};
 use graph::{
     components::store::SubscriptionManager,
     prelude::{
         async_trait, o, CheapClone, DeploymentState, GraphQlRunner as GraphQlRunnerTrait, Logger,
-        Query, QueryExecutionError, Subscription, SubscriptionError, SubscriptionResult,
+        Query, QueryExecutionError, Subscription, SubscriptionError, SubscriptionResult, ENV_VARS,
     },
 };
 use graph::{data::graphql::effort::LoadManager, prelude::QueryStoreManager};
@@ -19,7 +20,51 @@ use graph::{
     prelude::QueryStore,
 };
 
-use lazy_static::lazy_static;
+pub struct ResultSizeMetrics {
+    histogram: Box<Histogram>,
+    max_gauge: Box<Gauge>,
+}
+
+impl ResultSizeMetrics {
+    fn new(registry: Arc<impl MetricsRegistry>) -> Self {
+        // Divide the Histogram into exponentially sized buckets between 1k and 4G
+        let bins = (10..32).map(|n| 2u64.pow(n) as f64).collect::<Vec<_>>();
+        let histogram = registry
+            .new_histogram(
+                "query_result_size",
+                "the size of the result of successful GraphQL queries (in CacheWeight)",
+                bins,
+            )
+            .unwrap();
+
+        let max_gauge = registry
+            .new_gauge(
+                "query_result_max",
+                "the maximum size of a query result (in CacheWeight)",
+                HashMap::new(),
+            )
+            .unwrap();
+
+        Self {
+            histogram,
+            max_gauge,
+        }
+    }
+
+    // Tests need to construct one of these, but normal code doesn't
+    #[cfg(debug_assertions)]
+    pub fn make(registry: Arc<impl MetricsRegistry>) -> Self {
+        Self::new(registry)
+    }
+
+    pub fn observe(&self, size: usize) {
+        let size = size as f64;
+        self.histogram.observe(size);
+        if self.max_gauge.get() < size {
+            self.max_gauge.set(size);
+        }
+    }
+}
 
 /// GraphQL runner implementation for The Graph.
 pub struct GraphQlRunner<S, SM> {
@@ -27,45 +72,11 @@ pub struct GraphQlRunner<S, SM> {
     store: Arc<S>,
     subscription_manager: Arc<SM>,
     load_manager: Arc<LoadManager>,
-}
-
-lazy_static! {
-    static ref GRAPHQL_QUERY_TIMEOUT: Option<Duration> = env::var("GRAPH_GRAPHQL_QUERY_TIMEOUT")
-        .ok()
-        .map(|s| Duration::from_secs(
-            u64::from_str(&s)
-                .unwrap_or_else(|_| panic!("failed to parse env var GRAPH_GRAPHQL_QUERY_TIMEOUT"))
-        ));
-    static ref GRAPHQL_MAX_COMPLEXITY: Option<u64> = env::var("GRAPH_GRAPHQL_MAX_COMPLEXITY")
-        .ok()
-        .map(|s| u64::from_str(&s)
-            .unwrap_or_else(|_| panic!("failed to parse env var GRAPH_GRAPHQL_MAX_COMPLEXITY")));
-    static ref GRAPHQL_MAX_DEPTH: u8 = env::var("GRAPH_GRAPHQL_MAX_DEPTH")
-        .ok()
-        .map(|s| u8::from_str(&s)
-            .unwrap_or_else(|_| panic!("failed to parse env var GRAPH_GRAPHQL_MAX_DEPTH")))
-        .unwrap_or(u8::max_value());
-    static ref GRAPHQL_MAX_FIRST: u32 = env::var("GRAPH_GRAPHQL_MAX_FIRST")
-        .ok()
-        .map(|s| u32::from_str(&s)
-            .unwrap_or_else(|_| panic!("failed to parse env var GRAPH_GRAPHQL_MAX_FIRST")))
-        .unwrap_or(1000);
-    static ref GRAPHQL_MAX_SKIP: u32 = env::var("GRAPH_GRAPHQL_MAX_SKIP")
-        .ok()
-        .map(|s| u32::from_str(&s)
-            .unwrap_or_else(|_| panic!("failed to parse env var GRAPH_GRAPHQL_MAX_SKIP")))
-        .unwrap_or(std::u32::MAX);
-    // Allow skipping the check whether a deployment has changed while
-    // we were running a query. Once we are sure that the check mechanism
-    // is reliable, this variable should be removed
-    static ref GRAPHQL_ALLOW_DEPLOYMENT_CHANGE: bool = env::var("GRAPHQL_ALLOW_DEPLOYMENT_CHANGE")
-        .ok()
-        .map(|s| s == "true")
-        .unwrap_or(false);
+    result_size: Arc<ResultSizeMetrics>,
 }
 
 #[cfg(debug_assertions)]
-lazy_static! {
+lazy_static::lazy_static! {
     // Test only, see c435c25decbc4ad7bbbadf8e0ced0ff2
     pub static ref INITIAL_DEPLOYMENT_STATE_FOR_TESTS: std::sync::Mutex<Option<DeploymentState>> = std::sync::Mutex::new(None);
 }
@@ -81,13 +92,16 @@ where
         store: Arc<S>,
         subscription_manager: Arc<SM>,
         load_manager: Arc<LoadManager>,
+        registry: Arc<impl MetricsRegistry>,
     ) -> Self {
         let logger = logger.new(o!("component" => "GraphQlRunner"));
+        let result_size = Arc::new(ResultSizeMetrics::new(registry));
         GraphQlRunner {
             logger,
             store,
             subscription_manager,
             load_manager,
+            result_size,
         }
     }
 
@@ -101,7 +115,7 @@ where
         state: DeploymentState,
         latest_block: u64,
     ) -> Result<(), QueryExecutionError> {
-        if *GRAPHQL_ALLOW_DEPLOYMENT_CHANGE {
+        if ENV_VARS.graphql.allow_deployment_change {
             return Ok(());
         }
         let new_state = store.deployment_state().await?;
@@ -129,6 +143,7 @@ where
         max_depth: Option<u8>,
         max_first: Option<u32>,
         max_skip: Option<u32>,
+        result_size: Arc<ResultSizeMetrics>,
     ) -> Result<QueryResults, QueryResults> {
         // We need to use the same `QueryStore` for the entire query to ensure
         // we have a consistent view if the world, even when replicas, which
@@ -152,7 +167,7 @@ where
             .clone()
             .unwrap_or(state);
 
-        let max_depth = max_depth.unwrap_or(*GRAPHQL_MAX_DEPTH);
+        let max_depth = max_depth.unwrap_or(ENV_VARS.graphql.max_depth);
         let query = crate::execution::Query::new(
             &self.logger,
             schema,
@@ -181,6 +196,7 @@ where
                 bc,
                 error_policy,
                 query.schema.id().clone(),
+                result_size.cheap_clone(),
             )
             .await?;
             max_block = max_block.max(resolver.block_number());
@@ -190,9 +206,9 @@ where
                 resolver.block_ptr.clone(),
                 QueryExecutionOptions {
                     resolver,
-                    deadline: GRAPHQL_QUERY_TIMEOUT.map(|t| Instant::now() + t),
-                    max_first: max_first.unwrap_or(*GRAPHQL_MAX_FIRST),
-                    max_skip: max_skip.unwrap_or(*GRAPHQL_MAX_SKIP),
+                    deadline: ENV_VARS.graphql.query_timeout.map(|t| Instant::now() + t),
+                    max_first: max_first.unwrap_or(ENV_VARS.graphql.max_first),
+                    max_skip: max_skip.unwrap_or(ENV_VARS.graphql.max_skip),
                     load_manager: self.load_manager.clone(),
                 },
             )
@@ -218,10 +234,10 @@ where
         self.run_query_with_complexity(
             query,
             target,
-            *GRAPHQL_MAX_COMPLEXITY,
-            Some(*GRAPHQL_MAX_DEPTH),
-            Some(*GRAPHQL_MAX_FIRST),
-            Some(*GRAPHQL_MAX_SKIP),
+            ENV_VARS.graphql.max_complexity,
+            Some(ENV_VARS.graphql.max_depth),
+            Some(ENV_VARS.graphql.max_first),
+            Some(ENV_VARS.graphql.max_skip),
         )
         .await
     }
@@ -242,6 +258,7 @@ where
             max_depth,
             max_first,
             max_skip,
+            self.result_size.cheap_clone(),
         )
         .await
         .unwrap_or_else(|e| e)
@@ -259,10 +276,10 @@ where
         let query = crate::execution::Query::new(
             &self.logger,
             schema,
-            Some(network.clone()),
+            Some(network),
             subscription.query,
-            *GRAPHQL_MAX_COMPLEXITY,
-            *GRAPHQL_MAX_DEPTH,
+            ENV_VARS.graphql.max_complexity,
+            ENV_VARS.graphql.max_depth,
         )?;
 
         if let Err(err) = self
@@ -283,14 +300,14 @@ where
                 logger: self.logger.clone(),
                 store,
                 subscription_manager: self.subscription_manager.cheap_clone(),
-                timeout: *GRAPHQL_QUERY_TIMEOUT,
-                max_complexity: *GRAPHQL_MAX_COMPLEXITY,
-                max_depth: *GRAPHQL_MAX_DEPTH,
-                max_first: *GRAPHQL_MAX_FIRST,
-                max_skip: *GRAPHQL_MAX_SKIP,
+                timeout: ENV_VARS.graphql.query_timeout,
+                max_complexity: ENV_VARS.graphql.max_complexity,
+                max_depth: ENV_VARS.graphql.max_depth,
+                max_first: ENV_VARS.graphql.max_first,
+                max_skip: ENV_VARS.graphql.max_skip,
+                result_size: self.result_size.clone(),
             },
         )
-        .await
     }
 
     fn load_manager(&self) -> Arc<LoadManager> {

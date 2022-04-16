@@ -1,15 +1,15 @@
 use graph::{
     blockchain::ChainHeadUpdateStream,
-    parking_lot::RwLock,
     prelude::{
         futures03::{self, FutureExt},
         tokio, StoreError,
     },
     prometheus::{CounterVec, GaugeVec},
+    util::timed_rw_lock::TimedRwLock,
 };
-use std::str::FromStr;
-use std::sync::Arc;
-use std::{collections::BTreeMap, time::Duration};
+use std::collections::BTreeMap;
+use std::sync::atomic;
+use std::sync::{atomic::AtomicBool, Arc};
 
 use lazy_static::lazy_static;
 
@@ -22,32 +22,28 @@ use graph::blockchain::ChainHeadUpdateListener as ChainHeadUpdateListenerTrait;
 use graph::prelude::serde::{Deserialize, Serialize};
 use graph::prelude::serde_json::{self, json};
 use graph::prelude::tokio::sync::{mpsc::Receiver, watch};
-use graph::prelude::{crit, debug, o, CheapClone, Logger, MetricsRegistry};
+use graph::prelude::{crit, debug, o, CheapClone, Logger, MetricsRegistry, ENV_VARS};
 
 lazy_static! {
-    pub static ref CHAIN_HEAD_WATCHER_TIMEOUT: Duration = Duration::from_secs(
-        std::env::var("GRAPH_CHAIN_HEAD_WATCHER_TIMEOUT")
-            .ok()
-            .map(|s| u64::from_str(&s).unwrap_or_else(|_| panic!(
-                "failed to parse env var GRAPH_CHAIN_HEAD_WATCHER_TIMEOUT"
-            )))
-            .unwrap_or(30)
-    );
     pub static ref CHANNEL_NAME: SafeChannelName =
         SafeChannelName::i_promise_this_is_safe("chain_head_updates");
 }
 
 struct Watcher {
-    sender: watch::Sender<()>,
+    sender: Arc<watch::Sender<()>>,
     receiver: watch::Receiver<()>,
 }
 
 impl Watcher {
     fn new() -> Self {
         let (sender, receiver) = watch::channel(());
-        Watcher { sender, receiver }
+        Watcher {
+            sender: Arc::new(sender),
+            receiver,
+        }
     }
 
+    #[allow(dead_code)]
     fn send(&self) {
         // Unwrap: `self` holds a receiver.
         self.sender.send(()).unwrap()
@@ -87,7 +83,7 @@ struct ChainHeadUpdate {
 
 pub struct ChainHeadUpdateListener {
     /// Update watchers keyed by network.
-    watchers: Arc<RwLock<BTreeMap<String, Watcher>>>,
+    watchers: Arc<TimedRwLock<BTreeMap<String, Watcher>>>,
     _listener: NotificationListener,
 }
 
@@ -113,7 +109,10 @@ impl ChainHeadUpdateListener {
         // Create a Postgres notification listener for chain head updates
         let (mut listener, receiver) =
             NotificationListener::new(&logger, postgres_url, CHANNEL_NAME.clone());
-        let watchers = Arc::new(RwLock::new(BTreeMap::new()));
+        let watchers = Arc::new(TimedRwLock::new(
+            BTreeMap::new(),
+            "chain_head_listener_watchers",
+        ));
 
         Self::listen(
             logger,
@@ -139,11 +138,12 @@ impl ChainHeadUpdateListener {
         metrics: Arc<BlockIngestorMetrics>,
         listener: &mut NotificationListener,
         mut receiver: Receiver<JsonNotification>,
-        watchers: Arc<RwLock<BTreeMap<String, Watcher>>>,
+        watchers: Arc<TimedRwLock<BTreeMap<String, Watcher>>>,
         counter: CounterVec,
     ) {
         // Process chain head updates in a dedicated task
         graph::spawn(async move {
+            let sending_to_watcher = Arc::new(AtomicBool::new(false));
             while let Some(notification) = receiver.recv().await {
                 // Create ChainHeadUpdate from JSON
                 let update: ChainHeadUpdate =
@@ -169,8 +169,20 @@ impl ChainHeadUpdateListener {
                     .set_chain_head_number(&update.network_name, *&update.head_block_number as i64);
 
                 // If there are subscriptions for this network, notify them.
-                if let Some(watcher) = watchers.read().get(&update.network_name) {
-                    watcher.send()
+                if let Some(watcher) = watchers.read(&logger).get(&update.network_name) {
+                    // Due to a tokio bug, we must assume that the watcher can deadlock, see
+                    // https://github.com/tokio-rs/tokio/issues/4246.
+                    if !sending_to_watcher.load(atomic::Ordering::SeqCst) {
+                        let sending_to_watcher = sending_to_watcher.cheap_clone();
+                        let sender = watcher.sender.cheap_clone();
+                        tokio::task::spawn_blocking(move || {
+                            sending_to_watcher.store(true, atomic::Ordering::SeqCst);
+                            sender.send(()).unwrap();
+                            sending_to_watcher.store(false, atomic::Ordering::SeqCst);
+                        });
+                    } else {
+                        debug!(logger, "skipping chain head update, watcher is deadlocked"; "network" => &update.network_name);
+                    }
                 }
             }
         });
@@ -182,9 +194,11 @@ impl ChainHeadUpdateListener {
 
 impl ChainHeadUpdateListenerTrait for ChainHeadUpdateListener {
     fn subscribe(&self, network_name: String, logger: Logger) -> ChainHeadUpdateStream {
+        debug!(logger, "subscribing to chain head updates");
+
         let update_receiver = {
             let existing = {
-                let watchers = self.watchers.read();
+                let watchers = self.watchers.read(&logger);
                 watchers.get(&network_name).map(|w| w.receiver.clone())
             };
 
@@ -197,9 +211,9 @@ impl ChainHeadUpdateListenerTrait for ChainHeadUpdateListener {
                 // Race condition: Another task could have simoultaneously entered this branch and
                 // inserted a writer, so we should check the entry again after acquiring the lock.
                 self.watchers
-                    .write()
+                    .write(&logger)
                     .entry(network_name)
-                    .or_insert_with(|| Watcher::new())
+                    .or_insert_with(Watcher::new)
                     .receiver
                     .clone()
             }
@@ -213,7 +227,7 @@ impl ChainHeadUpdateListenerTrait for ChainHeadUpdateListener {
                     // To be robust against any problems with the listener for the DB channel, a
                     // timeout is set so that subscribers are guaranteed to get periodic updates.
                     match tokio::time::timeout(
-                        *CHAIN_HEAD_WATCHER_TIMEOUT,
+                        ENV_VARS.store.chain_head_watcher_timeout,
                         update_receiver.changed(),
                     )
                     .await
@@ -227,7 +241,7 @@ impl ChainHeadUpdateListenerTrait for ChainHeadUpdateListener {
                         Err(_) => debug!(
                             logger,
                             "no chain head update for {} seconds, polling for update",
-                            CHAIN_HEAD_WATCHER_TIMEOUT.as_secs()
+                            ENV_VARS.store.chain_head_watcher_timeout.as_secs()
                         ),
                     };
                     Some(((), update_receiver))
