@@ -1,7 +1,7 @@
 extern crate clap;
 extern crate graph_store_postgres;
 
-use clap::App;
+use clap::{arg, Command};
 use std::process::exit;
 use std::{fs, sync::Arc};
 
@@ -121,19 +121,17 @@ fn print_diesel_tables(layout: &Layout) {
 }
 
 pub fn main() {
-    let args = App::new("layout")
+    let args = Command::new("layout")
     .version("1.0")
     .about("Information about the database schema for a GraphQL schema")
-    .args_from_usage(
-        "-g, --generate=[KIND] 'what kind of SQL to generate. Can be ddl (the default), migrate, delete, or drop'
-        <schema>
-        [db_schema]"
-    )
+    .arg(arg!(-g --generate <KIND> "what kind of SQL to generate. Can be ddl (the default), migrate, delete, or drop"))
+    .arg(arg!(<schema>))
+    .arg(arg!(<db_schema>))
     .get_matches();
 
-    let schema = args.value_of("schema").unwrap();
-    let namespace = args.value_of("db_schema").unwrap_or("subgraphs");
-    let kind = args.value_of("generate").unwrap_or("ddl");
+    let schema = args.get_one::<&str>("schema").unwrap();
+    let namespace = args.get_one::<&str>("db_schema").unwrap_or(&"subgraphs");
+    let kind = args.get_one::<&str>("generate").unwrap_or(&"ddl");
 
     let subgraph = DeploymentHash::new("Qmasubgraph").unwrap();
     let schema = ensure(fs::read_to_string(schema), "Can not read schema file");
@@ -154,7 +152,7 @@ pub fn main() {
         Layout::new(site, &schema, catalog),
         "Failed to construct Mapping",
     );
-    match kind {
+    match *kind {
         "drop" => print_drop(&layout),
         "delete" => print_delete_all(&layout),
         "ddl" => print_ddl(&layout),

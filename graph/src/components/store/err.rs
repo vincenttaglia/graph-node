@@ -1,9 +1,9 @@
+use super::{BlockNumber, DeploymentHash, DeploymentSchemaVersion};
+use crate::prelude::QueryExecutionError;
 use anyhow::{anyhow, Error};
+use diesel::result::Error as DieselError;
 use thiserror::Error;
 use tokio::task::JoinError;
-
-use super::{BlockNumber, DeploymentHash};
-use crate::prelude::QueryExecutionError;
 
 #[derive(Error, Debug)]
 pub enum StoreError {
@@ -44,12 +44,20 @@ pub enum StoreError {
     Canceled,
     #[error("database unavailable")]
     DatabaseUnavailable,
+    #[error("database disabled")]
+    DatabaseDisabled,
     #[error("subgraph forking failed: {0}")]
     ForkFailure(String),
     #[error("subgraph writer poisoned by previous error")]
     Poisoned,
     #[error("panic in subgraph writer: {0}")]
     WriterPanic(JoinError),
+    #[error(
+        "found schema version {0} but this graph node only supports versions up to {}. \
+         Did you downgrade Graph Node?",
+        DeploymentSchemaVersion::LATEST
+    )]
+    UnsupportedDeploymentSchemaVersion(i32),
 }
 
 // Convenience to report a constraint violation
@@ -63,8 +71,20 @@ macro_rules! constraint_violation {
     }}
 }
 
-impl From<::diesel::result::Error> for StoreError {
-    fn from(e: ::diesel::result::Error) -> Self {
+impl From<DieselError> for StoreError {
+    fn from(e: DieselError) -> Self {
+        // When the error is caused by a closed connection, treat the error
+        // as 'database unavailable'. When this happens during indexing, the
+        // indexing machinery will retry in that case rather than fail the
+        // subgraph
+        if let DieselError::DatabaseError(_, info) = &e {
+            if info
+                .message()
+                .contains("server closed the connection unexpectedly")
+            {
+                return StoreError::DatabaseUnavailable;
+            }
+        }
         StoreError::Unknown(e.into())
     }
 }

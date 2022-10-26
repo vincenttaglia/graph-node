@@ -3,6 +3,7 @@ use std::{collections::HashMap, sync::Arc, time::SystemTime};
 
 use graph::{
     components::store::BlockStore as _,
+    data::query::QueryTarget,
     prelude::{
         anyhow::{anyhow, bail, Error},
         chrono::{DateTime, Duration, SecondsFormat, Utc},
@@ -83,13 +84,19 @@ pub async fn create(
     primary: ConnectionPool,
     src: DeploymentSearch,
     shard: String,
+    shards: Vec<String>,
     node: String,
     block_offset: u32,
 ) -> Result<(), Error> {
     let block_offset = block_offset as i32;
     let subgraph_store = store.subgraph_store();
     let src = src.locate_unique(&primary)?;
-    let query_store = store.query_store(src.hash.clone().into(), true).await?;
+    let query_store = store
+        .query_store(
+            QueryTarget::Deployment(src.hash.clone(), Default::default()),
+            true,
+        )
+        .await?;
     let network = query_store.network_name();
 
     let src_ptr = query_store.block_ptr().await?.ok_or_else(|| anyhow!("subgraph {} has not indexed any blocks yet and can not be used as the source of a copy", src))?;
@@ -103,21 +110,27 @@ pub async fn create(
         .block_store()
         .chain_store(&network)
         .ok_or_else(|| anyhow!("could not find chain store for network {}", network))?;
-    let hashes = chain_store.block_hashes_by_block_number(src_number)?;
+    let mut hashes = chain_store.block_hashes_by_block_number(src_number)?;
     let hash = match hashes.len() {
         0 => bail!(
             "could not find a block with number {} in our cache",
             src_number
         ),
-        1 => hashes[0],
+        1 => hashes.pop().unwrap(),
         n => bail!(
             "the cache contains {} hashes for block number {}",
             n,
             src_number
         ),
     };
-    let base_ptr = BlockPtr::from((hash, src_number));
+    let base_ptr = BlockPtr::new(hash, src_number);
 
+    if !shards.contains(&shard) {
+        bail!(
+            "unknown shard {shard}, only shards {} are configured",
+            shards.join(", ")
+        )
+    }
     let shard = Shard::new(shard)?;
     let node = NodeId::new(node.clone()).map_err(|()| anyhow!("invalid node id `{}`", node))?;
 

@@ -110,7 +110,7 @@ pub struct EnvVars {
     /// are enabled.
     pub allow_non_deterministic_fulltext_search: bool,
     /// Set by the environment variable `GRAPH_MAX_SPEC_VERSION`. The default
-    /// value is `0.0.4`.
+    /// value is `0.0.7`.
     pub max_spec_version: Version,
     /// Set by the flag `GRAPH_DISABLE_GRAFTS`.
     pub disable_grafts: bool,
@@ -203,6 +203,9 @@ pub struct EnvVars {
     /// Set by the environment variable `EXTERNAL_WS_BASE_URL`. No default
     /// value is provided.
     pub external_ws_base_url: Option<String>,
+    /// Maximum number of Dynamic Data Sources after which a Subgraph will
+    /// switch to using static filter.
+    pub static_filters_threshold: usize,
 }
 
 impl EnvVars {
@@ -258,6 +261,7 @@ impl EnvVars {
             explorer_query_threshold: Duration::from_millis(inner.explorer_query_threshold_in_msec),
             external_http_base_url: inner.external_http_base_url,
             external_ws_base_url: inner.external_ws_base_url,
+            static_filters_threshold: inner.static_filters_threshold,
         })
     }
 
@@ -310,7 +314,7 @@ struct Inner {
         default = "false"
     )]
     allow_non_deterministic_fulltext_search: EnvVarBoolean,
-    #[envconfig(from = "GRAPH_MAX_SPEC_VERSION", default = "0.0.5")]
+    #[envconfig(from = "GRAPH_MAX_SPEC_VERSION", default = "0.0.7")]
     max_spec_version: Version,
     #[envconfig(from = "GRAPH_DISABLE_GRAFTS", default = "false")]
     disable_grafts: EnvVarBoolean,
@@ -324,7 +328,12 @@ struct Inner {
     elastic_search_max_retries: usize,
     #[envconfig(from = "GRAPH_LOCK_CONTENTION_LOG_THRESHOLD_MS", default = "100")]
     lock_contention_log_threshold_in_ms: u64,
-    #[envconfig(from = "GRAPH_MAX_GAS_PER_HANDLER", default = "")]
+
+    // For now this is set absurdly high by default because we've seen many cases of gas being
+    // overestimated and failing otherwise legit subgraphs. Once gas costs have been better
+    // benchmarked and adjusted, and out of gas has been made a deterministic error, this default
+    // should be removed and this should somehow be gated on `UNSAFE_CONFIG`.
+    #[envconfig(from = "GRAPH_MAX_GAS_PER_HANDLER", default = "1_000_000_000_000_000")]
     max_gas_per_handler:
         WithDefaultUsize<NoUnderscores<u64>, { CONST_MAX_GAS_PER_HANDLER as usize }>,
     #[envconfig(from = "GRAPH_LOG_QUERY_TIMING", default = "")]
@@ -366,6 +375,9 @@ struct Inner {
     external_http_base_url: Option<String>,
     #[envconfig(from = "EXTERNAL_WS_BASE_URL")]
     external_ws_base_url: Option<String>,
+    // Setting this to be unrealistically high so it doesn't get triggered.
+    #[envconfig(from = "GRAPH_STATIC_FILTERS_THRESHOLD", default = "100000000")]
+    static_filters_threshold: usize,
 }
 
 #[derive(Clone, Debug)]

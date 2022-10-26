@@ -75,9 +75,11 @@ impl QueryStoreManager for Store {
         graph::prelude::QueryExecutionError,
     > {
         let store = self.subgraph_store.cheap_clone();
+        let api_version = target.get_version();
+        let target = target.clone();
         let (store, site, replica) = graph::spawn_blocking_allow_panic(move || {
             store
-                .replica_for_query(target, for_subscription)
+                .replica_for_query(target.clone(), for_subscription)
                 .map_err(|e| e.into())
         })
         .await
@@ -92,7 +94,13 @@ impl QueryStoreManager for Store {
             )
         })?;
 
-        Ok(Arc::new(QueryStore::new(store, chain_store, site, replica)))
+        Ok(Arc::new(QueryStore::new(
+            store,
+            chain_store,
+            site,
+            replica,
+            Arc::new(api_version.clone()),
+        )))
     }
 }
 
@@ -101,7 +109,6 @@ impl StatusStore for Store {
     fn status(&self, filter: status::Filter) -> Result<Vec<status::Info>, StoreError> {
         let mut infos = self.subgraph_store.status(filter)?;
         let ptrs = self.block_store.chain_head_pointers()?;
-
         for info in &mut infos {
             for chain in &mut info.chains {
                 chain.chain_head_block = ptrs.get(&chain.network).map(|ptr| ptr.to_owned().into());
@@ -154,8 +161,8 @@ impl StatusStore for Store {
             .await
     }
 
-    async fn query_permit(&self) -> tokio::sync::OwnedSemaphorePermit {
+    async fn query_permit(&self) -> Result<tokio::sync::OwnedSemaphorePermit, StoreError> {
         // Status queries go to the primary shard.
-        self.block_store.query_permit_primary().await
+        Ok(self.block_store.query_permit_primary().await)
     }
 }

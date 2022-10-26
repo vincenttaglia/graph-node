@@ -285,7 +285,11 @@ impl EthereumAdapter {
             );
         }
 
-        let step_size = ENV_VARS.trace_stream_step_size;
+        // Go one block at a time if requesting all traces, to not overload the RPC.
+        let step_size = match addresses.is_empty() {
+            false => ENV_VARS.trace_stream_step_size,
+            true => 1,
+        };
 
         let eth = self.clone();
         let logger = logger.to_owned();
@@ -456,7 +460,7 @@ impl EthereumAdapter {
                     let result = web3.eth().call(req, Some(block_id)).boxed().await;
 
                     // Try to check if the call was reverted. The JSON-RPC response for reverts is
-                    // not standardized, so we have ad-hoc checks for each Ethereum client                    // Ganache.
+                    // not standardized, so we have ad-hoc checks for each Ethereum client.
 
                     // 0xfe is the "designated bad instruction" of the EVM, and Solidity uses it for
                     // asserts.
@@ -474,17 +478,18 @@ impl EthereumAdapter {
 
                     const PARITY_VM_EXECUTION_ERROR: i64 = -32015;
                     const PARITY_REVERT_PREFIX: &str = "Reverted 0x";
+                    const XDAI_REVERT: &str = "revert";
 
                     // Deterministic Geth execution errors. We might need to expand this as
                     // subgraphs come across other errors. See
                     // https://github.com/ethereum/go-ethereum/blob/cd57d5cd38ef692de8fbedaa56598b4e9fbfbabc/core/vm/errors.go
                     const GETH_EXECUTION_ERRORS: &[&str] = &[
-                        // Hardhat format.
-                        "error: transaction reverted",
-                        // Ganache and Moonbeam format.
-                        "vm exception while processing transaction: revert",
-                        // Geth errors
-                        "execution reverted",
+                        // The "revert" substring covers a few known error messages, including:
+                        // Hardhat: "error: transaction reverted",
+                        // Ganache and Moonbeam: "vm exception while processing transaction: revert",
+                        // Geth: "execution reverted"
+                        // And others.
+                        "revert",
                         "invalid jump destination",
                         "invalid opcode",
                         // Ethereum says 1024 is the stack sizes limit, so this is deterministic.
@@ -534,7 +539,8 @@ impl EthereumAdapter {
                                         || data.starts_with(PARITY_STACK_LIMIT_PREFIX)
                                         || data == PARITY_BAD_INSTRUCTION_FE
                                         || data == PARITY_BAD_INSTRUCTION_FD
-                                        || data == PARITY_OUT_OF_GAS =>
+                                        || data == PARITY_OUT_OF_GAS
+                                        || data == XDAI_REVERT =>
                                 {
                                     let reason = if data == PARITY_BAD_INSTRUCTION_FE {
                                         PARITY_BAD_INSTRUCTION_FE.to_owned()
@@ -695,8 +701,12 @@ impl EthereumAdapter {
     ) -> Box<dyn Stream<Item = EthereumCall, Error = Error> + Send + 'a> {
         let eth = self.clone();
 
-        let addresses: Vec<H160> = call_filter
-            .contract_addresses_function_signatures
+        let EthereumCallFilter {
+            contract_addresses_function_signatures,
+            wildcard_signatures,
+        } = call_filter;
+
+        let mut addresses: Vec<H160> = contract_addresses_function_signatures
             .iter()
             .filter(|(_addr, (start_block, _fsigs))| start_block <= &to)
             .map(|(addr, (_start_block, _fsigs))| *addr)
@@ -704,10 +714,17 @@ impl EthereumAdapter {
             .into_iter()
             .collect::<Vec<H160>>();
 
-        if addresses.is_empty() {
+        if addresses.is_empty() && wildcard_signatures.is_empty() {
             // The filter has no started data sources in the requested range, nothing to do.
             // This prevents an expensive call to `trace_filter` with empty `addresses`.
             return Box::new(stream::empty());
+        }
+
+        // if wildcard_signatures is on, we can't filter by topic so we need to get all the traces.
+        if addresses.len() > 100 || !wildcard_signatures.is_empty() {
+            // If the address list is large, request all traces, this avoids generating huge
+            // requests and potentially getting 413 errors.
+            addresses = vec![];
         }
 
         Box::new(
@@ -847,7 +864,11 @@ impl EthereumAdapterTrait for EthereumAdapter {
         let web3 = self.web3.clone();
         let metrics = self.metrics.clone();
         let provider = self.provider().to_string();
-        let gen_block_hash_future = retry("eth_getBlockByNumber(0, false) RPC call", &logger)
+        let retry_log_message = format!(
+            "eth_getBlockByNumber({}, false) RPC call",
+            ENV_VARS.genesis_block_number
+        );
+        let gen_block_hash_future = retry(retry_log_message, &logger)
             .no_limit()
             .timeout_secs(30)
             .run(move || {
@@ -856,7 +877,9 @@ impl EthereumAdapterTrait for EthereumAdapter {
                 let provider = provider.clone();
                 async move {
                     web3.eth()
-                        .block(BlockId::Number(Web3BlockNumber::Number(0.into())))
+                        .block(BlockId::Number(Web3BlockNumber::Number(
+                            ENV_VARS.genesis_block_number.into(),
+                        )))
                         .await
                         .map_err(|e| {
                             metrics.set_status(ProviderStatus::GenesisFail, &provider);
@@ -1178,7 +1201,7 @@ impl EthereumAdapterTrait for EthereumAdapter {
             Err(e) => return Box::new(future::err(EthereumContractCallError::EncodingError(e))),
         };
 
-        trace!(logger, "eth_call";
+        debug!(logger, "eth_call";
             "address" => hex::encode(&call.address),
             "data" => hex::encode(&call_data)
         );
@@ -1249,7 +1272,7 @@ impl EthereumAdapterTrait for EthereumAdapter {
         let block_hashes: Vec<_> = block_hashes.iter().cloned().collect();
         // Search for the block in the store first then use json-rpc as a backup.
         let mut blocks: Vec<Arc<LightEthereumBlock>> = chain_store
-            .blocks(&block_hashes)
+            .blocks(&block_hashes.iter().map(|&b| b.into()).collect::<Vec<_>>())
             .map_err(|e| error!(&logger, "Error accessing block cache {}", e))
             .unwrap_or_default()
             .into_iter()
@@ -1829,7 +1852,12 @@ fn resolve_transaction_receipt(
             // Check if the receipt has a block hash and is for the right block. Parity nodes seem
             // to return receipts with no block hash when a transaction is no longer in the main
             // chain, so treat that case the same as a receipt being absent entirely.
-            if receipt.block_hash != Some(block_hash) {
+            //
+            // Also as a sanity check against provider nonsense, check that the receipt transaction
+            // hash and the requested transaction hash match.
+            if receipt.block_hash != Some(block_hash)
+                || transaction_hash != receipt.transaction_hash
+            {
                 info!(
                     logger, "receipt block mismatch";
                     "receipt_block_hash" =>
@@ -1837,6 +1865,7 @@ fn resolve_transaction_receipt(
                     "block_hash" =>
                         block_hash.to_string(),
                     "tx_hash" => transaction_hash.to_string(),
+                    "receipt_tx_hash" => receipt.transaction_hash.to_string(),
                 );
 
                 // If the receipt came from a different block, then the Ethereum node no longer
@@ -1877,7 +1906,13 @@ async fn get_logs_and_transactions(
 ) -> Result<Vec<EthereumTrigger>, anyhow::Error> {
     // Obtain logs externally
     let logs = adapter
-        .logs_in_block_range(logger, subgraph_metrics, from, to, log_filter.clone())
+        .logs_in_block_range(
+            logger,
+            subgraph_metrics.cheap_clone(),
+            from,
+            to,
+            log_filter.clone(),
+        )
         .await?;
 
     // Not all logs have associated transaction hashes, nor do all triggers require them.
@@ -1913,6 +1948,7 @@ async fn get_logs_and_transactions(
     let transaction_receipts_by_hash = get_transaction_receipts_for_transaction_hashes(
         &adapter,
         &transaction_hashes_by_block,
+        subgraph_metrics,
         logger.cheap_clone(),
     )
     .await?;
@@ -1934,6 +1970,7 @@ async fn get_logs_and_transactions(
 async fn get_transaction_receipts_for_transaction_hashes(
     adapter: &EthereumAdapter,
     transaction_hashes_by_block: &HashMap<H256, HashSet<H256>>,
+    subgraph_metrics: Arc<SubgraphEthRpcMetrics>,
     logger: Logger,
 ) -> Result<HashMap<H256, Arc<TransactionReceipt>>, anyhow::Error> {
     use std::collections::hash_map::Entry::Vacant;
@@ -1965,7 +2002,28 @@ async fn get_transaction_receipts_for_transaction_hashes(
             receipt_futures.push(receipt_future)
         }
     }
-    let receipts: Vec<_> = receipt_futures.try_collect().await?;
+
+    // Execute futures while monitoring elapsed time
+    let start = Instant::now();
+    let receipts: Vec<_> = match receipt_futures.try_collect().await {
+        Ok(receipts) => {
+            let elapsed = start.elapsed().as_secs_f64();
+            subgraph_metrics.observe_request(
+                elapsed,
+                "eth_getTransactionReceipt",
+                &adapter.provider,
+            );
+            receipts
+        }
+        Err(ingestor_error) => {
+            subgraph_metrics.add_error("eth_getTransactionReceipt", &adapter.provider);
+            debug!(
+                logger,
+                "Error querying transaction receipts: {}", ingestor_error
+            );
+            return Err(ingestor_error.into());
+        }
+    };
 
     // Build a map between transaction hashes and their receipts
     for receipt in receipts.into_iter() {
@@ -1986,4 +2044,130 @@ async fn get_transaction_receipts_for_transaction_hashes(
     );
 
     Ok(receipts_by_hash)
+}
+
+#[cfg(test)]
+mod tests {
+
+    use crate::trigger::{EthereumBlockTriggerType, EthereumTrigger};
+
+    use super::{parse_block_triggers, EthereumBlock, EthereumBlockFilter, EthereumBlockWithCalls};
+    use graph::blockchain::BlockPtr;
+    use graph::prelude::ethabi::ethereum_types::U64;
+    use graph::prelude::web3::types::{Address, Block, Bytes, H256};
+    use graph::prelude::EthereumCall;
+    use std::collections::HashSet;
+    use std::iter::FromIterator;
+    use std::sync::Arc;
+
+    #[test]
+    fn parse_block_triggers_every_block() {
+        let block = EthereumBlockWithCalls {
+            ethereum_block: EthereumBlock {
+                block: Arc::new(Block {
+                    hash: Some(hash(2)),
+                    number: Some(U64::from(2)),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            },
+            calls: Some(vec![EthereumCall {
+                to: address(4),
+                input: bytes(vec![1; 36]),
+                ..Default::default()
+            }]),
+        };
+
+        assert_eq!(
+            vec![EthereumTrigger::Block(
+                BlockPtr::from((hash(2), 2)),
+                EthereumBlockTriggerType::Every
+            )],
+            parse_block_triggers(
+                &EthereumBlockFilter {
+                    contract_addresses: HashSet::from_iter(vec![(10, address(1))]),
+                    trigger_every_block: true,
+                },
+                &block
+            ),
+            "every block should generate a trigger even when address don't match"
+        );
+    }
+
+    #[test]
+    fn parse_block_triggers_specific_call_not_found() {
+        let block = EthereumBlockWithCalls {
+            ethereum_block: EthereumBlock {
+                block: Arc::new(Block {
+                    hash: Some(hash(2)),
+                    number: Some(U64::from(2)),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            },
+            calls: Some(vec![EthereumCall {
+                to: address(4),
+                input: bytes(vec![1; 36]),
+                ..Default::default()
+            }]),
+        };
+
+        assert_eq!(
+            Vec::<EthereumTrigger>::new(),
+            parse_block_triggers(
+                &EthereumBlockFilter {
+                    contract_addresses: HashSet::from_iter(vec![(1, address(1))]),
+                    trigger_every_block: false,
+                },
+                &block
+            ),
+            "block filter specifies address 1 but block does not contain any call to it"
+        );
+    }
+
+    #[test]
+    fn parse_block_triggers_specific_call_found() {
+        let block = EthereumBlockWithCalls {
+            ethereum_block: EthereumBlock {
+                block: Arc::new(Block {
+                    hash: Some(hash(2)),
+                    number: Some(U64::from(2)),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            },
+            calls: Some(vec![EthereumCall {
+                to: address(4),
+                input: bytes(vec![1; 36]),
+                ..Default::default()
+            }]),
+        };
+
+        assert_eq!(
+            vec![EthereumTrigger::Block(
+                BlockPtr::from((hash(2), 2)),
+                EthereumBlockTriggerType::WithCallTo(address(4))
+            )],
+            parse_block_triggers(
+                &EthereumBlockFilter {
+                    contract_addresses: HashSet::from_iter(vec![(1, address(4))]),
+                    trigger_every_block: false,
+                },
+                &block
+            ),
+            "block filter specifies address 4 and block has call to it"
+        );
+    }
+
+    fn address(id: u64) -> Address {
+        Address::from_low_u64_be(id)
+    }
+
+    fn hash(id: u8) -> H256 {
+        H256::from([id; 32])
+    }
+
+    fn bytes(value: Vec<u8>) -> Bytes {
+        Bytes::from(value)
+    }
 }

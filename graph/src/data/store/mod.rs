@@ -1,7 +1,7 @@
 use crate::{
-    components::store::{DeploymentLocator, EntityType},
+    components::store::{DeploymentLocator, EntityKey, EntityType},
     data::graphql::ObjectTypeExt,
-    prelude::{anyhow::Context, q, r, s, CacheWeight, EntityKey, QueryExecutionError, Schema},
+    prelude::{anyhow::Context, q, r, s, CacheWeight, QueryExecutionError, Schema},
     runtime::gas::{Gas, GasSizeOf},
 };
 use crate::{data::subgraph::DeploymentHash, prelude::EntityChange};
@@ -9,7 +9,7 @@ use anyhow::{anyhow, Error};
 use itertools::Itertools;
 use serde::de;
 use serde::{Deserialize, Serialize};
-use stable_hash::prelude::*;
+use stable_hash::{FieldAddress, StableHash, StableHasher};
 use std::convert::TryFrom;
 use std::fmt;
 use std::iter::FromIterator;
@@ -63,14 +63,8 @@ impl NodeId {
     pub fn new(s: impl Into<String>) -> Result<Self, ()> {
         let s = s.into();
 
-        // Enforce length limit
-        if s.len() > 63 {
-            return Err(());
-        }
-
-        // Check that the ID contains only allowed characters.
-        // Note: these restrictions are relied upon to prevent SQL injection
-        if !s.chars().all(|c| c.is_ascii_alphanumeric() || c == '_') {
+        // Enforce minimum and maximum length limit
+        if s.len() > 63 || s.len() < 1 {
             return Err(());
         }
 
@@ -189,8 +183,54 @@ pub enum Value {
     BigInt(scalar::BigInt),
 }
 
+impl stable_hash_legacy::StableHash for Value {
+    fn stable_hash<H: stable_hash_legacy::StableHasher>(
+        &self,
+        mut sequence_number: H::Seq,
+        state: &mut H,
+    ) {
+        use stable_hash_legacy::prelude::*;
+        use Value::*;
+
+        // This is the default, so write nothing.
+        if self == &Null {
+            return;
+        }
+        stable_hash_legacy::StableHash::stable_hash(
+            &self.as_static().to_string(),
+            sequence_number.next_child(),
+            state,
+        );
+
+        match self {
+            Null => unreachable!(),
+            String(inner) => {
+                stable_hash_legacy::StableHash::stable_hash(inner, sequence_number, state)
+            }
+            Int(inner) => {
+                stable_hash_legacy::StableHash::stable_hash(inner, sequence_number, state)
+            }
+            BigDecimal(inner) => {
+                stable_hash_legacy::StableHash::stable_hash(inner, sequence_number, state)
+            }
+            Bool(inner) => {
+                stable_hash_legacy::StableHash::stable_hash(inner, sequence_number, state)
+            }
+            List(inner) => {
+                stable_hash_legacy::StableHash::stable_hash(inner, sequence_number, state)
+            }
+            Bytes(inner) => {
+                stable_hash_legacy::StableHash::stable_hash(inner, sequence_number, state)
+            }
+            BigInt(inner) => {
+                stable_hash_legacy::StableHash::stable_hash(inner, sequence_number, state)
+            }
+        }
+    }
+}
+
 impl StableHash for Value {
-    fn stable_hash<H: StableHasher>(&self, mut sequence_number: H::Seq, state: &mut H) {
+    fn stable_hash<H: StableHasher>(&self, field_address: H::Addr, state: &mut H) {
         use Value::*;
 
         // This is the default, so write nothing.
@@ -198,19 +238,39 @@ impl StableHash for Value {
             return;
         }
 
-        self.as_static()
-            .stable_hash(sequence_number.next_child(), state);
-
-        match self {
+        let variant = match self {
             Null => unreachable!(),
-            String(inner) => inner.stable_hash(sequence_number, state),
-            Int(inner) => inner.stable_hash(sequence_number, state),
-            BigDecimal(inner) => inner.stable_hash(sequence_number, state),
-            Bool(inner) => inner.stable_hash(sequence_number, state),
-            List(inner) => inner.stable_hash(sequence_number, state),
-            Bytes(inner) => inner.stable_hash(sequence_number, state),
-            BigInt(inner) => inner.stable_hash(sequence_number, state),
-        }
+            String(inner) => {
+                inner.stable_hash(field_address.child(0), state);
+                1
+            }
+            Int(inner) => {
+                inner.stable_hash(field_address.child(0), state);
+                2
+            }
+            BigDecimal(inner) => {
+                inner.stable_hash(field_address.child(0), state);
+                3
+            }
+            Bool(inner) => {
+                inner.stable_hash(field_address.child(0), state);
+                4
+            }
+            List(inner) => {
+                inner.stable_hash(field_address.child(0), state);
+                5
+            }
+            Bytes(inner) => {
+                inner.stable_hash(field_address.child(0), state);
+                6
+            }
+            BigInt(inner) => {
+                inner.stable_hash(field_address.child(0), state);
+                7
+            }
+        };
+
+        state.write(field_address, &[variant])
     }
 }
 
@@ -519,17 +579,27 @@ where
     }
 }
 
-// Note: Do not modify fields without making a backward compatible change to the
-//  StableHash impl (below) An entity is represented as a map of attribute names
-//  to values.
 /// An entity is represented as a map of attribute names to values.
 #[derive(Clone, Debug, Default, Deserialize, PartialEq, Eq, Serialize)]
 pub struct Entity(HashMap<Attribute, Value>);
 
-impl StableHash for Entity {
+impl stable_hash_legacy::StableHash for Entity {
     #[inline]
-    fn stable_hash<H: StableHasher>(&self, mut sequence_number: H::Seq, state: &mut H) {
-        self.0.stable_hash(sequence_number.next_child(), state);
+    fn stable_hash<H: stable_hash_legacy::StableHasher>(
+        &self,
+        mut sequence_number: H::Seq,
+        state: &mut H,
+    ) {
+        use stable_hash_legacy::SequenceNumber;
+        let Self(inner) = self;
+        stable_hash_legacy::StableHash::stable_hash(inner, sequence_number.next_child(), state);
+    }
+}
+
+impl StableHash for Entity {
+    fn stable_hash<H: StableHasher>(&self, field_address: H::Addr, state: &mut H) {
+        let Self(inner) = self;
+        StableHash::stable_hash(inner, field_address.child(0), state);
     }
 }
 
@@ -801,16 +871,6 @@ pub trait TryIntoEntity {
     fn try_into_entity(self) -> Result<Entity, Error>;
 }
 
-/// A value that can be converted to an `Entity` ID.
-pub trait ToEntityId {
-    fn to_entity_id(&self) -> String;
-}
-
-/// A value that can be converted to an `Entity` key.
-pub trait ToEntityKey {
-    fn to_entity_key(&self, subgraph: DeploymentHash) -> EntityKey;
-}
-
 #[test]
 fn value_bytes() {
     let graphql_value = r::Value::String("0x8f494c66afc1d3f8ac1b45df21f02a46".to_owned());
@@ -872,11 +932,7 @@ fn entity_validation() {
         let schema =
             crate::prelude::Schema::parse(DOCUMENT, subgraph).expect("Failed to parse test schema");
         let id = thing.id().unwrap_or("none".to_owned());
-        let key = EntityKey::data(
-            DeploymentHash::new("doesntmatter").unwrap(),
-            "Thing".to_owned(),
-            id.to_owned(),
-        );
+        let key = EntityKey::data("Thing".to_owned(), id.clone());
 
         let err = thing.validate(&schema, &key);
         if errmsg == "" {

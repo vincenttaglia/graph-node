@@ -1,9 +1,13 @@
 use web3::types::{Address, H256};
 
 use super::*;
+use crate::blockchain::block_stream::FirehoseCursor;
 use crate::components::server::index_node::VersionInfo;
 use crate::components::transaction_receipt;
+use crate::components::versions::ApiVersion;
+use crate::data::query::Trace;
 use crate::data::subgraph::status;
+use crate::data::value::Word;
 use crate::data::{query::QueryTarget, subgraph::schema::*};
 
 pub trait SubscriptionManager: Send + Sync + 'static {
@@ -109,7 +113,11 @@ pub trait SubgraphStore: Send + Sync + 'static {
 
     /// Return the GraphQL schema that was derived from the user's schema by
     /// adding a root query type etc. to it
-    fn api_schema(&self, subgraph_id: &DeploymentHash) -> Result<Arc<ApiSchema>, StoreError>;
+    fn api_schema(
+        &self,
+        subgraph_id: &DeploymentHash,
+        api_version: &ApiVersion,
+    ) -> Result<Arc<ApiSchema>, StoreError>;
 
     /// Return a `SubgraphFork`, derived from the user's `debug-fork` deployment argument,
     /// that is used for debugging purposes only.
@@ -122,12 +130,21 @@ pub trait SubgraphStore: Send + Sync + 'static {
     /// Return a `WritableStore` that is used for indexing subgraphs. Only
     /// code that is part of indexing a subgraph should ever use this. The
     /// `logger` will be used to log important messages related to the
-    /// subgraph
+    /// subgraph.
+    ///
+    /// This function should only be called in situations where no
+    /// assumptions about the in-memory state of writing has been made; in
+    /// particular, no assumptions about whether previous writes have
+    /// actually been committed or not.
     async fn writable(
         self: Arc<Self>,
         logger: Logger,
         deployment: DeploymentId,
     ) -> Result<Arc<dyn WritableStore>, StoreError>;
+
+    /// Initiate a graceful shutdown of the writable that a previous call to
+    /// `writable` might have started
+    async fn stop_subgraph(&self, deployment: &DeploymentLocator) -> Result<(), StoreError>;
 
     /// Return the minimum block pointer of all deployments with this `id`
     /// that we would use to query or copy from; in particular, this will
@@ -135,8 +152,49 @@ pub trait SubgraphStore: Send + Sync + 'static {
     /// being set up
     async fn least_block_ptr(&self, id: &DeploymentHash) -> Result<Option<BlockPtr>, StoreError>;
 
+    async fn is_healthy(&self, id: &DeploymentHash) -> Result<bool, StoreError>;
+
     /// Find the deployment locators for the subgraph with the given hash
     fn locators(&self, hash: &str) -> Result<Vec<DeploymentLocator>, StoreError>;
+
+    /// This migrates subgraphs that existed before the raw_yaml column was added.
+    async fn set_manifest_raw_yaml(
+        &self,
+        hash: &DeploymentHash,
+        raw_yaml: String,
+    ) -> Result<(), StoreError>;
+}
+
+pub trait ReadStore: Send + Sync + 'static {
+    /// Looks up an entity using the given store key at the latest block.
+    fn get(&self, key: &EntityKey) -> Result<Option<Entity>, StoreError>;
+
+    /// Look up multiple entities as of the latest block. Returns a map of
+    /// entities by type.
+    fn get_many(
+        &self,
+        ids_for_type: BTreeMap<&EntityType, Vec<&str>>,
+    ) -> Result<BTreeMap<EntityType, Vec<Entity>>, StoreError>;
+
+    fn input_schema(&self) -> Arc<Schema>;
+}
+
+// This silly impl is needed until https://github.com/rust-lang/rust/issues/65991 is stable.
+impl<T: ?Sized + ReadStore> ReadStore for Arc<T> {
+    fn get(&self, key: &EntityKey) -> Result<Option<Entity>, StoreError> {
+        (**self).get(key)
+    }
+
+    fn get_many(
+        &self,
+        ids_for_type: BTreeMap<&EntityType, Vec<&str>>,
+    ) -> Result<BTreeMap<EntityType, Vec<Entity>>, StoreError> {
+        (**self).get_many(ids_for_type)
+    }
+
+    fn input_schema(&self) -> Arc<Schema> {
+        (**self).input_schema()
+    }
 }
 
 /// A view of the store for indexing. All indexing-related operations need
@@ -144,16 +202,13 @@ pub trait SubgraphStore: Send + Sync + 'static {
 /// `StoreError::DatabaseUnavailable`. Instead, they will retry the
 /// operation indefinitely until it succeeds.
 #[async_trait]
-pub trait WritableStore: Send + Sync + 'static {
+pub trait WritableStore: ReadStore {
     /// Get a pointer to the most recently processed block in the subgraph.
-    async fn block_ptr(&self) -> Option<BlockPtr>;
+    fn block_ptr(&self) -> Option<BlockPtr>;
 
     /// Returns the Firehose `cursor` this deployment is currently at in the block stream of events. This
     /// is used when re-connecting a Firehose stream to start back exactly where we left off.
-    async fn block_cursor(&self) -> Option<String>;
-
-    /// Deletes the current Firehose `cursor` this deployment is currently at.
-    async fn delete_block_cursor(&self) -> Result<(), StoreError>;
+    fn block_cursor(&self) -> FirehoseCursor;
 
     /// Start an existing subgraph deployment.
     async fn start_subgraph_deployment(&self, logger: &Logger) -> Result<(), StoreError>;
@@ -165,12 +220,12 @@ pub trait WritableStore: Send + Sync + 'static {
     async fn revert_block_operations(
         &self,
         block_ptr_to: BlockPtr,
-        firehose_cursor: Option<&str>,
+        firehose_cursor: FirehoseCursor,
     ) -> Result<(), StoreError>;
 
     /// If a deterministic error happened, this function reverts the block operations from the
     /// current block to the previous block.
-    fn unfail_deterministic_error(
+    async fn unfail_deterministic_error(
         &self,
         current_ptr: &BlockPtr,
         parent_ptr: &BlockPtr,
@@ -188,9 +243,6 @@ pub trait WritableStore: Send + Sync + 'static {
 
     async fn supports_proof_of_indexing(&self) -> Result<bool, StoreError>;
 
-    /// Looks up an entity using the given store key at the latest block.
-    fn get(&self, key: &EntityKey) -> Result<Option<Entity>, StoreError>;
-
     /// Transact the entity changes from a single block atomically into the store, and update the
     /// subgraph block pointer to `block_ptr_to`, and update the firehose cursor to `firehose_cursor`
     ///
@@ -198,19 +250,14 @@ pub trait WritableStore: Send + Sync + 'static {
     async fn transact_block_operations(
         &self,
         block_ptr_to: BlockPtr,
-        firehose_cursor: Option<String>,
+        firehose_cursor: FirehoseCursor,
         mods: Vec<EntityModification>,
         stopwatch: &StopwatchMetrics,
         data_sources: Vec<StoredDynamicDataSource>,
         deterministic_errors: Vec<SubgraphError>,
+        manifest_idx_and_name: Vec<(u32, String)>,
+        offchain_to_remove: Vec<StoredDynamicDataSource>,
     ) -> Result<(), StoreError>;
-
-    /// Look up multiple entities as of the latest block. Returns a map of
-    /// entities by type.
-    fn get_many(
-        &self,
-        ids_for_type: BTreeMap<&EntityType, Vec<&str>>,
-    ) -> Result<BTreeMap<EntityType, Vec<Entity>>, StoreError>;
 
     /// The deployment `id` finished syncing, mark it as synced in the database
     /// and promote it to the current version in the subgraphs where it was the
@@ -224,15 +271,16 @@ pub trait WritableStore: Send + Sync + 'static {
     fn unassign_subgraph(&self) -> Result<(), StoreError>;
 
     /// Load the dynamic data sources for the given deployment
-    async fn load_dynamic_data_sources(&self) -> Result<Vec<StoredDynamicDataSource>, StoreError>;
+    async fn load_dynamic_data_sources(
+        &self,
+        manifest_idx_and_name: Vec<(u32, String)>,
+    ) -> Result<Vec<StoredDynamicDataSource>, StoreError>;
 
     /// Report the name of the shard in which the subgraph is stored. This
     /// should only be used for reporting and monitoring
     fn shard(&self) -> &str;
 
-    async fn health(&self, id: &DeploymentHash) -> Result<SubgraphHealth, StoreError>;
-
-    fn input_schema(&self) -> Arc<Schema>;
+    async fn health(&self) -> Result<SubgraphHealth, StoreError>;
 
     /// Wait for the background writer to finish processing its queue
     async fn flush(&self) -> Result<(), StoreError>;
@@ -320,7 +368,7 @@ pub trait ChainStore: Send + Sync + 'static {
     ) -> Result<(), Error>;
 
     /// Returns the blocks present in the store.
-    fn blocks(&self, hashes: &[H256]) -> Result<Vec<serde_json::Value>, Error>;
+    fn blocks(&self, hashes: &[BlockHash]) -> Result<Vec<serde_json::Value>, Error>;
 
     /// Get the `offset`th ancestor of `block_hash`, where offset=0 means the block matching
     /// `block_hash` and offset=1 means its parent. Returns None if unable to complete due to
@@ -344,14 +392,20 @@ pub trait ChainStore: Send + Sync + 'static {
     ) -> Result<Option<(BlockNumber, usize)>, Error>;
 
     /// Return the hashes of all blocks with the given number
-    fn block_hashes_by_block_number(&self, number: BlockNumber) -> Result<Vec<H256>, Error>;
+    fn block_hashes_by_block_number(&self, number: BlockNumber) -> Result<Vec<BlockHash>, Error>;
 
     /// Confirm that block number `number` has hash `hash` and that the store
     /// may purge any other blocks with that number
-    fn confirm_block_hash(&self, number: BlockNumber, hash: &H256) -> Result<usize, Error>;
+    fn confirm_block_hash(&self, number: BlockNumber, hash: &BlockHash) -> Result<usize, Error>;
 
-    /// Find the block with `block_hash` and return the network name and number
-    fn block_number(&self, block_hash: H256) -> Result<Option<(String, BlockNumber)>, StoreError>;
+    /// Find the block with `block_hash` and return the network name, number and timestamp if present.
+    /// Currently, the timestamp is only returned if it's present in the top level block. This format is
+    /// depends on the chain and the implementation of Blockchain::Block for the specific chain.
+    /// eg: {"block": { "timestamp": 123123123 } }
+    async fn block_number(
+        &self,
+        hash: &BlockHash,
+    ) -> Result<Option<(String, BlockNumber, Option<u64>)>, StoreError>;
 
     /// Tries to retrieve all transactions receipts for a given block.
     async fn transaction_receipts_in_block(
@@ -390,18 +444,26 @@ pub trait QueryStore: Send + Sync {
     fn find_query_values(
         &self,
         query: EntityQuery,
-    ) -> Result<Vec<BTreeMap<String, r::Value>>, QueryExecutionError>;
+    ) -> Result<(Vec<BTreeMap<Word, r::Value>>, Trace), QueryExecutionError>;
 
     async fn is_deployment_synced(&self) -> Result<bool, Error>;
 
     async fn block_ptr(&self) -> Result<Option<BlockPtr>, StoreError>;
 
-    fn block_number(&self, block_hash: H256) -> Result<Option<BlockNumber>, StoreError>;
+    async fn block_number(&self, block_hash: &BlockHash)
+        -> Result<Option<BlockNumber>, StoreError>;
 
-    fn wait_stats(&self) -> PoolWaitStats;
+    /// Returns the blocknumber as well as the timestamp. Timestamp depends on the chain block type
+    /// and can have multiple formats, it can also not be prevent. For now this is only available
+    /// for EVM chains both firehose and rpc.
+    async fn block_number_with_timestamp(
+        &self,
+        block_hash: &BlockHash,
+    ) -> Result<Option<(BlockNumber, Option<u64>)>, StoreError>;
 
-    /// If `block` is `None`, assumes the latest block.
-    async fn has_non_fatal_errors(&self, block: Option<BlockNumber>) -> Result<bool, StoreError>;
+    fn wait_stats(&self) -> Result<PoolWaitStats, StoreError>;
+
+    async fn has_deterministic_errors(&self, block: BlockNumber) -> Result<bool, StoreError>;
 
     /// Find the current state for the subgraph deployment `id` and
     /// return details about it needed for executing queries
@@ -412,7 +474,7 @@ pub trait QueryStore: Send + Sync {
     fn network_name(&self) -> &str;
 
     /// A permit should be acquired before starting query execution.
-    async fn query_permit(&self) -> tokio::sync::OwnedSemaphorePermit;
+    async fn query_permit(&self) -> Result<tokio::sync::OwnedSemaphorePermit, StoreError>;
 }
 
 /// A view of the store that can provide information about the indexing status
@@ -420,7 +482,7 @@ pub trait QueryStore: Send + Sync {
 #[async_trait]
 pub trait StatusStore: Send + Sync + 'static {
     /// A permit should be acquired before starting query execution.
-    async fn query_permit(&self) -> tokio::sync::OwnedSemaphorePermit;
+    async fn query_permit(&self) -> Result<tokio::sync::OwnedSemaphorePermit, StoreError>;
 
     fn status(&self, filter: status::Filter) -> Result<Vec<status::Info>, StoreError>;
 

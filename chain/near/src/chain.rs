@@ -4,14 +4,14 @@ use graph::data::subgraph::UnifiedMappingApiVersion;
 use graph::firehose::{FirehoseEndpoint, FirehoseEndpoints};
 use graph::prelude::{MetricsRegistry, TryFutureExt};
 use graph::{
-    anyhow,
+    anyhow::Result,
     blockchain::{
         block_stream::{
             BlockStreamEvent, BlockWithTriggers, FirehoseError,
             FirehoseMapper as FirehoseMapperTrait, TriggersAdapter as TriggersAdapterTrait,
         },
         firehose_block_stream::FirehoseBlockStream,
-        BlockHash, BlockPtr, Blockchain, IngestorError,
+        BlockHash, BlockPtr, Blockchain, IngestorError, RuntimeAdapter as RuntimeAdapterTrait,
     },
     components::store::DeploymentLocator,
     firehose::{self as firehose, ForkStep},
@@ -29,7 +29,61 @@ use crate::{
     codec,
     data_source::{DataSource, UnresolvedDataSource},
 };
-use graph::blockchain::block_stream::BlockStream;
+use graph::blockchain::block_stream::{BlockStream, BlockStreamBuilder, FirehoseCursor};
+
+pub struct NearStreamBuilder {}
+
+#[async_trait]
+impl BlockStreamBuilder<Chain> for NearStreamBuilder {
+    async fn build_firehose(
+        &self,
+        chain: &Chain,
+        deployment: DeploymentLocator,
+        block_cursor: FirehoseCursor,
+        start_blocks: Vec<BlockNumber>,
+        subgraph_current_block: Option<BlockPtr>,
+        filter: Arc<<Chain as Blockchain>::TriggerFilter>,
+        unified_api_version: UnifiedMappingApiVersion,
+    ) -> Result<Box<dyn BlockStream<Chain>>> {
+        let adapter = chain
+            .triggers_adapter(&deployment, &NodeCapabilities {}, unified_api_version)
+            .expect(&format!("no adapter for network {}", chain.name,));
+
+        let firehose_endpoint = chain.firehose_endpoints.random()?;
+
+        let logger = chain
+            .logger_factory
+            .subgraph_logger(&deployment)
+            .new(o!("component" => "FirehoseBlockStream"));
+
+        let firehose_mapper = Arc::new(FirehoseMapper {});
+
+        Ok(Box::new(FirehoseBlockStream::new(
+            deployment.hash,
+            firehose_endpoint,
+            subgraph_current_block,
+            block_cursor,
+            firehose_mapper,
+            adapter,
+            filter,
+            start_blocks,
+            logger,
+            chain.metrics_registry.clone(),
+        )))
+    }
+
+    async fn build_polling(
+        &self,
+        _chain: Arc<Chain>,
+        _deployment: DeploymentLocator,
+        _start_blocks: Vec<BlockNumber>,
+        _subgraph_current_block: Option<BlockPtr>,
+        _filter: Arc<<Chain as Blockchain>::TriggerFilter>,
+        _unified_api_version: UnifiedMappingApiVersion,
+    ) -> Result<Box<dyn BlockStream<Chain>>> {
+        todo!()
+    }
+}
 
 pub struct Chain {
     logger_factory: LoggerFactory,
@@ -37,6 +91,7 @@ pub struct Chain {
     firehose_endpoints: Arc<FirehoseEndpoints>,
     chain_store: Arc<dyn ChainStore>,
     metrics_registry: Arc<dyn MetricsRegistry>,
+    block_stream_builder: Arc<dyn BlockStreamBuilder<Self>>,
 }
 
 impl std::fmt::Debug for Chain {
@@ -52,6 +107,7 @@ impl Chain {
         chain_store: Arc<dyn ChainStore>,
         firehose_endpoints: FirehoseEndpoints,
         metrics_registry: Arc<dyn MetricsRegistry>,
+        block_stream_builder: Arc<dyn BlockStreamBuilder<Self>>,
     ) -> Self {
         Chain {
             logger_factory,
@@ -59,6 +115,7 @@ impl Chain {
             firehose_endpoints: Arc::new(firehose_endpoints),
             chain_store,
             metrics_registry,
+            block_stream_builder,
         }
     }
 }
@@ -77,8 +134,6 @@ impl Blockchain for Chain {
 
     type UnresolvedDataSourceTemplate = UnresolvedDataSourceTemplate;
 
-    type TriggersAdapter = TriggersAdapter;
-
     type TriggerData = crate::trigger::NearTrigger;
 
     type MappingTrigger = crate::trigger::NearTrigger;
@@ -87,14 +142,12 @@ impl Blockchain for Chain {
 
     type NodeCapabilities = crate::capabilities::NodeCapabilities;
 
-    type RuntimeAdapter = RuntimeAdapter;
-
     fn triggers_adapter(
         &self,
         _loc: &DeploymentLocator,
         _capabilities: &Self::NodeCapabilities,
         _unified_api_version: UnifiedMappingApiVersion,
-    ) -> Result<Arc<Self::TriggersAdapter>, Error> {
+    ) -> Result<Arc<dyn TriggersAdapterTrait<Self>>, Error> {
         let adapter = TriggersAdapter {};
         Ok(Arc::new(adapter))
     }
@@ -102,42 +155,23 @@ impl Blockchain for Chain {
     async fn new_firehose_block_stream(
         &self,
         deployment: DeploymentLocator,
-        block_cursor: Option<String>,
+        block_cursor: FirehoseCursor,
         start_blocks: Vec<BlockNumber>,
         subgraph_current_block: Option<BlockPtr>,
         filter: Arc<Self::TriggerFilter>,
         unified_api_version: UnifiedMappingApiVersion,
     ) -> Result<Box<dyn BlockStream<Self>>, Error> {
-        let adapter = self
-            .triggers_adapter(&deployment, &NodeCapabilities {}, unified_api_version)
-            .expect(&format!("no adapter for network {}", self.name,));
-
-        let firehose_endpoint = match self.firehose_endpoints.random() {
-            Some(e) => e.clone(),
-            None => return Err(anyhow::format_err!("no firehose endpoint available")),
-        };
-
-        let logger = self
-            .logger_factory
-            .subgraph_logger(&deployment)
-            .new(o!("component" => "FirehoseBlockStream"));
-
-        let firehose_mapper = Arc::new(FirehoseMapper {
-            endpoint: firehose_endpoint.cheap_clone(),
-        });
-
-        Ok(Box::new(FirehoseBlockStream::new(
-            deployment.hash,
-            firehose_endpoint,
-            subgraph_current_block,
-            block_cursor,
-            firehose_mapper,
-            adapter,
-            filter,
-            start_blocks,
-            logger,
-            self.metrics_registry.clone(),
-        )))
+        self.block_stream_builder
+            .build_firehose(
+                self,
+                deployment,
+                block_cursor,
+                start_blocks,
+                subgraph_current_block,
+                filter,
+                unified_api_version,
+            )
+            .await
     }
 
     async fn new_polling_block_stream(
@@ -160,10 +194,7 @@ impl Blockchain for Chain {
         logger: &Logger,
         number: BlockNumber,
     ) -> Result<BlockPtr, IngestorError> {
-        let firehose_endpoint = match self.firehose_endpoints.random() {
-            Some(e) => e.clone(),
-            None => return Err(anyhow::format_err!("no firehose endpoint available").into()),
-        };
+        let firehose_endpoint = self.firehose_endpoints.random()?;
 
         firehose_endpoint
             .block_ptr_for_number::<codec::HeaderOnlyBlock>(logger, number)
@@ -171,7 +202,7 @@ impl Blockchain for Chain {
             .await
     }
 
-    fn runtime_adapter(&self) -> Arc<Self::RuntimeAdapter> {
+    fn runtime_adapter(&self) -> Arc<dyn RuntimeAdapterTrait<Self>> {
         Arc::new(RuntimeAdapter {})
     }
 
@@ -278,9 +309,7 @@ impl TriggersAdapterTrait<Chain> for TriggersAdapter {
     }
 }
 
-pub struct FirehoseMapper {
-    endpoint: Arc<FirehoseEndpoint>,
-}
+pub struct FirehoseMapper {}
 
 #[async_trait]
 impl FirehoseMapperTrait<Chain> for FirehoseMapper {
@@ -288,7 +317,7 @@ impl FirehoseMapperTrait<Chain> for FirehoseMapper {
         &self,
         logger: &Logger,
         response: &firehose::Response,
-        adapter: &TriggersAdapter,
+        adapter: &Arc<dyn TriggersAdapterTrait<Chain>>,
         filter: &TriggerFilter,
     ) -> Result<BlockStreamEvent<Chain>, FirehoseError> {
         let step = ForkStep::from_i32(response.step).unwrap_or_else(|| {
@@ -316,7 +345,7 @@ impl FirehoseMapperTrait<Chain> for FirehoseMapper {
         match step {
             StepNew => Ok(BlockStreamEvent::ProcessBlock(
                 adapter.triggers_in_block(logger, block, filter).await?,
-                Some(response.cursor.clone()),
+                FirehoseCursor::from(response.cursor.clone()),
             )),
 
             StepUndo => {
@@ -327,7 +356,7 @@ impl FirehoseMapperTrait<Chain> for FirehoseMapper {
 
                 Ok(BlockStreamEvent::Revert(
                     parent_ptr,
-                    Some(response.cursor.clone()),
+                    FirehoseCursor::from(response.cursor.clone()),
                 ))
             }
 
@@ -344,9 +373,10 @@ impl FirehoseMapperTrait<Chain> for FirehoseMapper {
     async fn block_ptr_for_number(
         &self,
         logger: &Logger,
+        endpoint: &Arc<FirehoseEndpoint>,
         number: BlockNumber,
     ) -> Result<BlockPtr, Error> {
-        self.endpoint
+        endpoint
             .block_ptr_for_number::<codec::HeaderOnlyBlock>(logger, number)
             .await
     }
@@ -354,39 +384,345 @@ impl FirehoseMapperTrait<Chain> for FirehoseMapper {
     async fn final_block_ptr_for(
         &self,
         logger: &Logger,
+        endpoint: &Arc<FirehoseEndpoint>,
         block: &codec::Block,
     ) -> Result<BlockPtr, Error> {
         let final_block_number = block.header().last_final_block_height as BlockNumber;
 
-        self.endpoint
-            .block_ptr_for_number::<codec::HeaderOnlyBlock>(logger, final_block_number)
+        self.block_ptr_for_number(logger, endpoint, final_block_number)
             .await
     }
 }
 
 #[cfg(test)]
 mod test {
-    use std::{collections::HashSet, vec};
+    use std::{collections::HashSet, sync::Arc, vec};
 
     use graph::{
-        blockchain::{block_stream::BlockWithTriggers, TriggersAdapter as _},
-        prelude::tokio,
+        blockchain::{block_stream::BlockWithTriggers, DataSource as _, TriggersAdapter as _},
+        prelude::{tokio, Link},
+        semver::Version,
         slog::{self, o, Logger},
     };
 
     use crate::{
         adapter::{NearReceiptFilter, TriggerFilter},
         codec::{
-            self, execution_outcome,
-            receipt::{self},
-            BlockHeader, DataReceiver, ExecutionOutcome, ExecutionOutcomeWithId,
-            IndexerExecutionOutcomeWithReceipt, IndexerShard, ReceiptAction,
-            SuccessValueExecutionStatus,
+            self, execution_outcome, receipt, Block, BlockHeader, DataReceiver, ExecutionOutcome,
+            ExecutionOutcomeWithId, IndexerExecutionOutcomeWithReceipt, IndexerShard,
+            ReceiptAction, SuccessValueExecutionStatus,
         },
+        data_source::{DataSource, Mapping, PartialAccounts, ReceiptHandler, NEAR_KIND},
+        trigger::{NearTrigger, ReceiptWithOutcome},
         Chain,
     };
 
     use super::TriggersAdapter;
+
+    #[test]
+    fn validate_empty() {
+        let ds = new_data_source(None, None);
+        let errs = ds.validate();
+        assert_eq!(errs.len(), 1, "{:?}", ds);
+        assert_eq!(errs[0].to_string(), "subgraph source address is required");
+    }
+
+    #[test]
+    fn validate_empty_account_none_partial() {
+        let ds = new_data_source(None, Some(PartialAccounts::default()));
+        let errs = ds.validate();
+        assert_eq!(errs.len(), 1, "{:?}", ds);
+        assert_eq!(errs[0].to_string(), "subgraph source address is required");
+    }
+
+    #[test]
+    fn validate_empty_account() {
+        let ds = new_data_source(
+            None,
+            Some(PartialAccounts {
+                prefixes: vec![],
+                suffixes: vec!["x.near".to_string()],
+            }),
+        );
+        let errs = ds.validate();
+        assert_eq!(errs.len(), 0, "{:?}", ds);
+    }
+
+    #[test]
+    fn validate_empty_prefix_and_suffix_values() {
+        let ds = new_data_source(
+            None,
+            Some(PartialAccounts {
+                prefixes: vec!["".to_string()],
+                suffixes: vec!["".to_string()],
+            }),
+        );
+        let errs: Vec<String> = ds
+            .validate()
+            .into_iter()
+            .map(|err| err.to_string())
+            .collect();
+        assert_eq!(errs.len(), 2, "{:?}", ds);
+
+        let expected_errors = vec![
+            "partial account prefixes can't have empty values".to_string(),
+            "partial account suffixes can't have empty values".to_string(),
+        ];
+        assert_eq!(
+            true,
+            expected_errors.iter().all(|err| errs.contains(err)),
+            "{:?}",
+            errs
+        );
+    }
+
+    #[test]
+    fn validate_empty_partials() {
+        let ds = new_data_source(Some("x.near".to_string()), None);
+        let errs = ds.validate();
+        assert_eq!(errs.len(), 0, "{:?}", ds);
+    }
+
+    #[test]
+    fn receipt_filter_from_ds() {
+        struct Case {
+            name: String,
+            account: Option<String>,
+            partial_accounts: Option<PartialAccounts>,
+            expected: HashSet<(Option<String>, Option<String>)>,
+        }
+
+        let cases = vec![
+            Case {
+                name: "2 prefix && 1 suffix".into(),
+                account: None,
+                partial_accounts: Some(PartialAccounts {
+                    prefixes: vec!["a".to_string(), "b".to_string()],
+                    suffixes: vec!["d".to_string()],
+                }),
+                expected: HashSet::from_iter(vec![
+                    (Some("a".to_string()), Some("d".to_string())),
+                    (Some("b".to_string()), Some("d".to_string())),
+                ]),
+            },
+            Case {
+                name: "1 prefix && 2 suffix".into(),
+                account: None,
+                partial_accounts: Some(PartialAccounts {
+                    prefixes: vec!["a".to_string()],
+                    suffixes: vec!["c".to_string(), "d".to_string()],
+                }),
+                expected: HashSet::from_iter(vec![
+                    (Some("a".to_string()), Some("c".to_string())),
+                    (Some("a".to_string()), Some("d".to_string())),
+                ]),
+            },
+            Case {
+                name: "no prefix".into(),
+                account: None,
+                partial_accounts: Some(PartialAccounts {
+                    prefixes: vec![],
+                    suffixes: vec!["c".to_string(), "d".to_string()],
+                }),
+                expected: HashSet::from_iter(vec![
+                    (None, Some("c".to_string())),
+                    (None, Some("d".to_string())),
+                ]),
+            },
+            Case {
+                name: "no suffix".into(),
+                account: None,
+                partial_accounts: Some(PartialAccounts {
+                    prefixes: vec!["a".to_string(), "b".to_string()],
+                    suffixes: vec![],
+                }),
+                expected: HashSet::from_iter(vec![
+                    (Some("a".to_string()), None),
+                    (Some("b".to_string()), None),
+                ]),
+            },
+        ];
+
+        for case in cases.into_iter() {
+            let ds1 = new_data_source(case.account, None);
+            let ds2 = new_data_source(None, case.partial_accounts);
+
+            let receipt = NearReceiptFilter::from_data_sources(vec![&ds1, &ds2]);
+            assert_eq!(
+                receipt.partial_accounts.len(),
+                case.expected.len(),
+                "name: {}\npartial_accounts: {:?}",
+                case.name,
+                receipt.partial_accounts,
+            );
+            assert_eq!(
+                true,
+                case.expected
+                    .iter()
+                    .all(|x| receipt.partial_accounts.contains(&x)),
+                "name: {}\npartial_accounts: {:?}",
+                case.name,
+                receipt.partial_accounts,
+            );
+        }
+    }
+
+    #[test]
+    fn data_source_match_and_decode() {
+        struct Request {
+            account: String,
+            matches: bool,
+        }
+        struct Case {
+            name: String,
+            account: Option<String>,
+            partial_accounts: Option<PartialAccounts>,
+            expected: Vec<Request>,
+        }
+
+        let cases = vec![
+            Case {
+                name: "2 prefix && 1 suffix".into(),
+                account: None,
+                partial_accounts: Some(PartialAccounts {
+                    prefixes: vec!["a".to_string(), "b".to_string()],
+                    suffixes: vec!["d".to_string()],
+                }),
+                expected: vec![
+                    Request {
+                        account: "ssssssd".to_string(),
+                        matches: false,
+                    },
+                    Request {
+                        account: "asasdasdas".to_string(),
+                        matches: false,
+                    },
+                    Request {
+                        account: "asd".to_string(),
+                        matches: true,
+                    },
+                    Request {
+                        account: "bsd".to_string(),
+                        matches: true,
+                    },
+                ],
+            },
+            Case {
+                name: "1 prefix && 2 suffix".into(),
+                account: None,
+                partial_accounts: Some(PartialAccounts {
+                    prefixes: vec!["a".to_string()],
+                    suffixes: vec!["c".to_string(), "d".to_string()],
+                }),
+                expected: vec![
+                    Request {
+                        account: "ssssssd".to_string(),
+                        matches: false,
+                    },
+                    Request {
+                        account: "asasdasdas".to_string(),
+                        matches: false,
+                    },
+                    Request {
+                        account: "asdc".to_string(),
+                        matches: true,
+                    },
+                    Request {
+                        account: "absd".to_string(),
+                        matches: true,
+                    },
+                ],
+            },
+            Case {
+                name: "no prefix with exact match".into(),
+                account: Some("bsda".to_string()),
+                partial_accounts: Some(PartialAccounts {
+                    prefixes: vec![],
+                    suffixes: vec!["c".to_string(), "d".to_string()],
+                }),
+                expected: vec![
+                    Request {
+                        account: "ssssss".to_string(),
+                        matches: false,
+                    },
+                    Request {
+                        account: "asasdasdas".to_string(),
+                        matches: false,
+                    },
+                    Request {
+                        account: "asdasdasdasdc".to_string(),
+                        matches: true,
+                    },
+                    Request {
+                        account: "bsd".to_string(),
+                        matches: true,
+                    },
+                    Request {
+                        account: "bsda".to_string(),
+                        matches: true,
+                    },
+                ],
+            },
+            Case {
+                name: "no suffix with exact match".into(),
+                account: Some("zbsd".to_string()),
+                partial_accounts: Some(PartialAccounts {
+                    prefixes: vec!["a".to_string(), "b".to_string()],
+                    suffixes: vec![],
+                }),
+                expected: vec![
+                    Request {
+                        account: "ssssssd".to_string(),
+                        matches: false,
+                    },
+                    Request {
+                        account: "zasdasdas".to_string(),
+                        matches: false,
+                    },
+                    Request {
+                        account: "asa".to_string(),
+                        matches: true,
+                    },
+                    Request {
+                        account: "bsb".to_string(),
+                        matches: true,
+                    },
+                    Request {
+                        account: "zbsd".to_string(),
+                        matches: true,
+                    },
+                ],
+            },
+        ];
+
+        let logger = Logger::root(slog::Discard, o!());
+        for case in cases.into_iter() {
+            let ds = new_data_source(case.account, case.partial_accounts);
+            let filter = NearReceiptFilter::from_data_sources(vec![&ds]);
+
+            for req in case.expected {
+                let res = filter.matches(&req.account);
+                assert_eq!(
+                    res, req.matches,
+                    "name: {} request:{} failed",
+                    case.name, req.account
+                );
+
+                let block = Arc::new(new_success_block(11, &req.account));
+                let receipt = Arc::new(new_receipt_with_outcome(&req.account, block.clone()));
+                let res = ds
+                    .match_and_decode(&NearTrigger::Receipt(receipt.clone()), &block, &logger)
+                    .expect("unable to process block");
+                assert_eq!(
+                    req.matches,
+                    res.is_some(),
+                    "case name: {} req: {}",
+                    case.name,
+                    req.account
+                );
+            }
+        }
+    }
 
     #[tokio::test]
     async fn test_trigger_filter_empty() {
@@ -444,6 +780,7 @@ mod test {
         let filter = TriggerFilter {
             receipt_filter: NearReceiptFilter {
                 accounts: HashSet::from_iter(vec![account1]),
+                partial_accounts: HashSet::new(),
             },
             ..Default::default()
         };
@@ -474,6 +811,7 @@ mod test {
         codec::Block {
             header: Some(BlockHeader {
                 height,
+                hash: Some(codec::CryptoHash { bytes: vec![0; 32] }),
                 ..Default::default()
             }),
             shards: vec![IndexerShard {
@@ -503,6 +841,62 @@ mod test {
                 ..Default::default()
             }],
             ..Default::default()
+        }
+    }
+
+    fn new_data_source(
+        account: Option<String>,
+        partial_accounts: Option<PartialAccounts>,
+    ) -> DataSource {
+        DataSource {
+            kind: NEAR_KIND.to_string(),
+            network: None,
+            name: "asd".to_string(),
+            source: crate::data_source::Source {
+                account,
+                start_block: 10,
+                accounts: partial_accounts,
+            },
+            mapping: Mapping {
+                api_version: Version::parse("1.0.0").expect("unable to parse version"),
+                language: "".to_string(),
+                entities: vec![],
+                block_handlers: vec![],
+                receipt_handlers: vec![ReceiptHandler {
+                    handler: "asdsa".to_string(),
+                }],
+                runtime: Arc::new(vec![]),
+                link: Link::default(),
+            },
+            context: Arc::new(None),
+            creation_block: None,
+        }
+    }
+
+    fn new_receipt_with_outcome(receiver_id: &String, block: Arc<Block>) -> ReceiptWithOutcome {
+        ReceiptWithOutcome {
+            outcome: ExecutionOutcomeWithId {
+                outcome: Some(ExecutionOutcome {
+                    status: Some(execution_outcome::Status::SuccessValue(
+                        SuccessValueExecutionStatus::default(),
+                    )),
+
+                    ..Default::default()
+                }),
+                ..Default::default()
+            },
+            receipt: codec::Receipt {
+                receipt: Some(receipt::Receipt::Action(ReceiptAction {
+                    output_data_receivers: vec![DataReceiver {
+                        receiver_id: receiver_id.clone(),
+                        ..Default::default()
+                    }],
+                    ..Default::default()
+                })),
+                receiver_id: receiver_id.clone(),
+                ..Default::default()
+            },
+            block,
         }
     }
 }

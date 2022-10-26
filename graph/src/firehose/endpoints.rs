@@ -4,14 +4,13 @@ use crate::{
     cheap_clone::CheapClone,
     components::store::BlockNumber,
     firehose::{decode_firehose_block, ForkStep},
-    prelude::{debug, info},
+    prelude::{anyhow, debug, info},
+    substreams,
 };
-use anyhow::Context;
 use futures03::StreamExt;
 use http::uri::{Scheme, Uri};
-use rand::prelude::IteratorRandom;
 use slog::Logger;
-use std::{collections::BTreeMap, fmt::Display, sync::Arc};
+use std::{collections::BTreeMap, fmt::Display, sync::Arc, time::Duration};
 use tonic::{
     metadata::MetadataValue,
     transport::{Channel, ClientTlsConfig},
@@ -20,36 +19,37 @@ use tonic::{
 
 use super::codec as firehose;
 
+const SUBGRAPHS_PER_CONN: usize = 100;
+
 #[derive(Clone, Debug)]
 pub struct FirehoseEndpoint {
     pub provider: String,
-    pub uri: String,
     pub token: Option<String>,
     pub filters_enabled: bool,
+    pub compression_enabled: bool,
     channel: Channel,
-    _logger: Logger,
 }
 
 impl Display for FirehoseEndpoint {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        Display::fmt(self.uri.as_str(), f)
+        Display::fmt(self.provider.as_str(), f)
     }
 }
 
 impl FirehoseEndpoint {
-    pub async fn new<S: AsRef<str>>(
-        logger: Logger,
+    pub fn new<S: AsRef<str>>(
         provider: S,
         url: S,
         token: Option<String>,
         filters_enabled: bool,
-    ) -> Result<Self, anyhow::Error> {
+        compression_enabled: bool,
+    ) -> Self {
         let uri = url
             .as_ref()
             .parse::<Uri>()
             .expect("the url should have been validated by now, so it is a valid Uri");
 
-        let endpoint = match uri.scheme().unwrap_or(&Scheme::HTTP).as_str() {
+        let endpoint_builder = match uri.scheme().unwrap_or(&Scheme::HTTP).as_str() {
             "http" => Channel::builder(uri),
             "https" => Channel::builder(uri)
                 .tls_config(ClientTlsConfig::new())
@@ -57,23 +57,31 @@ impl FirehoseEndpoint {
             _ => panic!("invalid uri scheme for firehose endpoint"),
         };
 
-        let uri = endpoint.uri().to_string();
-        let channel = endpoint.connect_lazy().with_context(|| {
-            format!(
-                "unable to lazily connect to firehose provider {} (at {})",
-                provider.as_ref(),
-                url.as_ref()
-            )
-        })?;
+        // Note on the connection window size: We run multiple block streams on a same connection,
+        // and a problematic subgraph with a stalled block stream might consume the entire window
+        // capacity for its http2 stream and never release it. If there are enough stalled block
+        // streams to consume all the capacity on the http2 connection, then _all_ subgraphs using
+        // this same http2 connection will stall. At a default stream window size of 2^16, setting
+        // the connection window size to the maximum of 2^31 allows for 2^15 streams without any
+        // contention, which is effectively unlimited for normal graph node operation.
+        //
+        // Note: Do not set `http2_keep_alive_interval` or `http2_adaptive_window`, as these will
+        // send ping frames, and many cloud load balancers will drop connections that frequently
+        // send pings.
+        let endpoint = endpoint_builder
+            .initial_connection_window_size(Some((1 << 31) - 1))
+            .connect_timeout(Duration::from_secs(10))
+            .tcp_keepalive(Some(Duration::from_secs(15)))
+            // Timeout on each request, so the timeout to estabilish each 'Blocks' stream.
+            .timeout(Duration::from_secs(120));
 
-        Ok(FirehoseEndpoint {
+        FirehoseEndpoint {
             provider: provider.as_ref().to_string(),
-            uri,
-            channel,
+            channel: endpoint.connect_lazy(),
             token,
-            _logger: logger,
             filters_enabled,
-        })
+            compression_enabled,
+        }
     }
 
     pub async fn genesis_block_ptr<M>(&self, logger: &Logger) -> Result<BlockPtr, anyhow::Error>
@@ -111,7 +119,12 @@ impl FirehoseEndpoint {
 
                 Ok(r)
             },
-        );
+        )
+        .accept_gzip();
+
+        if self.compression_enabled {
+            client = client.send_gzip();
+        }
 
         debug!(
             logger,
@@ -134,7 +147,7 @@ impl FirehoseEndpoint {
             .blocks(firehose::Request {
                 start_block_num: number as i64,
                 stop_block_num: number as u64,
-                fork_steps: vec![ForkStep::StepNew as i32, ForkStep::StepIrreversible as i32],
+                fork_steps: vec![ForkStep::StepNew as i32, ForkStep::StepUndo as i32],
                 ..Default::default()
             })
             .await?;
@@ -200,6 +213,36 @@ impl FirehoseEndpoint {
 
                 Ok(r)
             },
+        )
+        .accept_gzip();
+        if self.compression_enabled {
+            client = client.send_gzip();
+        }
+
+        let response_stream = client.blocks(request).await?;
+        let block_stream = response_stream.into_inner();
+
+        Ok(block_stream)
+    }
+
+    pub async fn substreams(
+        self: Arc<Self>,
+        request: substreams::Request,
+    ) -> Result<tonic::Streaming<substreams::Response>, anyhow::Error> {
+        let token_metadata = match self.token.clone() {
+            Some(token) => Some(MetadataValue::from_str(token.as_str())?),
+            None => None,
+        };
+
+        let mut client = substreams::stream_client::StreamClient::with_interceptor(
+            self.channel.cheap_clone(),
+            move |mut r: Request<()>| {
+                if let Some(ref t) = token_metadata {
+                    r.metadata_mut().insert("authorization", t.clone());
+                }
+
+                Ok(r)
+            },
         );
 
         let response_stream = client.blocks(request).await?;
@@ -208,6 +251,7 @@ impl FirehoseEndpoint {
         Ok(block_stream)
     }
 }
+
 #[derive(Clone, Debug)]
 pub struct FirehoseEndpoints(Vec<Arc<FirehoseEndpoint>>);
 
@@ -220,15 +264,32 @@ impl FirehoseEndpoints {
         self.0.len()
     }
 
-    pub fn random(&self) -> Option<&Arc<FirehoseEndpoint>> {
-        // Select from the matching adapters randomly
-        let mut rng = rand::thread_rng();
-        self.0.iter().choose(&mut rng)
+    // selects the FirehoseEndpoint with the least amount of references, which will help with spliting
+    // the load naively across the entire list.
+    pub fn random(&self) -> anyhow::Result<Arc<FirehoseEndpoint>> {
+        let endpoint = self
+            .0
+            .iter()
+            .min_by_key(|x| Arc::strong_count(x))
+            .ok_or(anyhow!("no available firehose endpoints"))?;
+        if Arc::strong_count(endpoint) > SUBGRAPHS_PER_CONN {
+            return Err(anyhow!("all connections saturated with {} connections, increase the firehose conn_pool_size", SUBGRAPHS_PER_CONN));
+        }
+
+        // Cloning here ensure we have the correct count at any given time, if we return a reference it can be cloned later
+        // which could cause a high number of endpoints to be given away before accounting for them.
+        Ok(endpoint.clone())
     }
 
     pub fn remove(&mut self, provider: &str) {
         self.0
             .retain(|network_endpoint| network_endpoint.provider != provider);
+    }
+}
+
+impl From<Vec<Arc<FirehoseEndpoint>>> for FirehoseEndpoints {
+    fn from(val: Vec<Arc<FirehoseEndpoint>>) -> Self {
+        FirehoseEndpoints(val)
     }
 }
 
@@ -275,5 +336,45 @@ impl FirehoseNetworks {
                     .map(move |endpoint| (chain_id.clone(), endpoint.clone()))
             })
             .collect()
+    }
+}
+
+#[cfg(test)]
+mod test {
+    use std::{mem, str::FromStr, sync::Arc};
+
+    use http::Uri;
+    use tonic::transport::Channel;
+
+    use super::{FirehoseEndpoint, FirehoseEndpoints, SUBGRAPHS_PER_CONN};
+
+    #[tokio::test]
+    async fn firehose_endpoint_errors() {
+        let endpoint = vec![Arc::new(FirehoseEndpoint {
+            provider: String::new(),
+            token: None,
+            filters_enabled: true,
+            compression_enabled: true,
+            channel: Channel::builder(Uri::from_str("http://127.0.0.1").unwrap()).connect_lazy(),
+        })];
+
+        let mut endpoints = FirehoseEndpoints::from(endpoint);
+
+        let mut keep = vec![];
+        for _i in 0..SUBGRAPHS_PER_CONN {
+            keep.push(endpoints.random().unwrap());
+        }
+
+        let err = endpoints.random().unwrap_err();
+        assert!(err.to_string().contains("conn_pool_size"));
+
+        mem::drop(keep);
+        endpoints.random().unwrap();
+
+        // Fails when empty too
+        endpoints.remove("");
+
+        let err = endpoints.random().unwrap_err();
+        assert!(err.to_string().contains("no available firehose endpoints"));
     }
 }

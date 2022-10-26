@@ -3,14 +3,15 @@ mod err;
 mod traits;
 
 pub use cache::{CachedEthereumCall, EntityCache, ModificationsAndCache};
+
 pub use err::StoreError;
+use itertools::Itertools;
 pub use traits::*;
 
 use futures::stream::poll_fn;
 use futures::{Async, Poll, Stream};
 use graphql_parser::schema as s;
 use serde::{Deserialize, Serialize};
-use stable_hash::prelude::*;
 use std::collections::btree_map::Entry;
 use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::fmt;
@@ -19,34 +20,35 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, RwLock};
 use std::time::Duration;
 
-use crate::blockchain::DataSource;
 use crate::blockchain::{Block, Blockchain};
-use crate::data::{store::*, subgraph::Source};
+use crate::data::store::scalar::Bytes;
+use crate::data::store::*;
+use crate::data::value::Word;
 use crate::prelude::*;
 
 /// The type name of an entity. This is the string that is used in the
 /// subgraph's GraphQL schema as `type NAME @entity { .. }`
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord, Hash)]
-pub struct EntityType(String);
+pub struct EntityType(Word);
 
 impl EntityType {
     /// Construct a new entity type. Ideally, this is only called when
     /// `entity_type` either comes from the GraphQL schema, or from
     /// the database from fields that are known to contain a valid entity type
     pub fn new(entity_type: String) -> Self {
-        Self(entity_type)
+        Self(entity_type.into())
     }
 
     pub fn as_str(&self) -> &str {
-        &self.0
+        self.0.as_str()
     }
 
     pub fn into_string(self) -> String {
-        self.0
+        self.0.to_string()
     }
 
     pub fn is_poi(&self) -> bool {
-        &self.0 == "Poi$"
+        self.0.as_str() == "Poi$"
     }
 }
 
@@ -79,60 +81,45 @@ impl From<&str> for EntityType {
 
 impl CheapClone for EntityType {}
 
-// Note: Do not modify fields without making a backward compatible change to
-// the StableHash impl (below)
-/// Key by which an individual entity in the store can be accessed.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct EntityFilterDerivative(bool);
+
+impl EntityFilterDerivative {
+    pub fn new(derived: bool) -> Self {
+        Self(derived)
+    }
+
+    pub fn is_derived(&self) -> bool {
+        self.0
+    }
+}
+
+/// Key by which an individual entity in the store can be accessed. Stores
+/// only the entity type and id. The deployment must be known from context.
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct EntityKey {
-    /// ID of the subgraph.
-    pub subgraph_id: DeploymentHash,
-
     /// Name of the entity type.
     pub entity_type: EntityType,
 
     /// ID of the individual entity.
-    pub entity_id: String,
-}
-
-impl StableHash for EntityKey {
-    fn stable_hash<H: StableHasher>(&self, mut sequence_number: H::Seq, state: &mut H) {
-        self.subgraph_id
-            .stable_hash(sequence_number.next_child(), state);
-        self.entity_type
-            .as_str()
-            .stable_hash(sequence_number.next_child(), state);
-        self.entity_id
-            .stable_hash(sequence_number.next_child(), state);
-    }
+    pub entity_id: Word,
 }
 
 impl EntityKey {
-    pub fn data(subgraph_id: DeploymentHash, entity_type: String, entity_id: String) -> Self {
+    pub fn data(entity_type: String, entity_id: String) -> Self {
         Self {
-            subgraph_id,
             entity_type: EntityType::new(entity_type),
-            entity_id,
+            entity_id: entity_id.into(),
         }
     }
 }
 
-#[test]
-fn key_stable_hash() {
-    use stable_hash::crypto::SetHasher;
-    use stable_hash::utils::stable_hash;
-
-    #[track_caller]
-    fn hashes_to(key: &EntityKey, exp: &str) {
-        let hash = hex::encode(stable_hash::<SetHasher, _>(&key));
-        assert_eq!(exp, hash.as_str());
-    }
-
-    let id = DeploymentHash::new("QmP9MRvVzwHxr3sGvujihbvJzcTz2LYLMfi5DyihBg6VUd").unwrap();
-    let key = EntityKey::data(id.clone(), "Account".to_string(), "0xdeadbeef".to_string());
-    hashes_to(
-        &key,
-        "905b57035d6f98cff8281e7b055e10570a2bd31190507341c6716af2d3c1ad98",
-    );
+#[derive(Clone, Debug, PartialEq)]
+pub struct Child {
+    pub attr: Attribute,
+    pub entity_type: EntityType,
+    pub filter: Box<EntityFilter>,
+    pub derived: bool,
 }
 
 /// Supported types of store filters.
@@ -161,6 +148,59 @@ pub enum EntityFilter {
     NotEndsWith(Attribute, Value),
     NotEndsWithNoCase(Attribute, Value),
     ChangeBlockGte(BlockNumber),
+    Child(Child),
+}
+
+// A somewhat concise string representation of a filter
+impl fmt::Display for EntityFilter {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        use EntityFilter::*;
+
+        match self {
+            And(fs) => {
+                write!(f, "{}", fs.iter().map(|f| f.to_string()).join(" and "))
+            }
+            Or(fs) => {
+                write!(f, "{}", fs.iter().map(|f| f.to_string()).join(" or "))
+            }
+            Equal(a, v) => write!(f, "{a} = {v}"),
+            Not(a, v) => write!(f, "{a} != {v}"),
+            GreaterThan(a, v) => write!(f, "{a} > {v}"),
+            LessThan(a, v) => write!(f, "{a} < {v}"),
+            GreaterOrEqual(a, v) => write!(f, "{a} >= {v}"),
+            LessOrEqual(a, v) => write!(f, "{a} <= {v}"),
+            In(a, vs) => write!(
+                f,
+                "{a} in ({})",
+                vs.into_iter().map(|v| v.to_string()).join(",")
+            ),
+            NotIn(a, vs) => write!(
+                f,
+                "{a} not in ({})",
+                vs.into_iter().map(|v| v.to_string()).join(",")
+            ),
+            Contains(a, v) => write!(f, "{a} ~ *{v}*"),
+            ContainsNoCase(a, v) => write!(f, "{a} ~ *{v}*i"),
+            NotContains(a, v) => write!(f, "{a} !~ *{v}*"),
+            NotContainsNoCase(a, v) => write!(f, "{a} !~ *{v}*i"),
+            StartsWith(a, v) => write!(f, "{a} ~ ^{v}*"),
+            StartsWithNoCase(a, v) => write!(f, "{a} ~ ^{v}*i"),
+            NotStartsWith(a, v) => write!(f, "{a} !~ ^{v}*"),
+            NotStartsWithNoCase(a, v) => write!(f, "{a} !~ ^{v}*i"),
+            EndsWith(a, v) => write!(f, "{a} ~ *{v}$"),
+            EndsWithNoCase(a, v) => write!(f, "{a} ~ *{v}$i"),
+            NotEndsWith(a, v) => write!(f, "{a} !~ *{v}$"),
+            NotEndsWithNoCase(a, v) => write!(f, "{a} !~ *{v}$i"),
+            ChangeBlockGte(b) => write!(f, "block >= {b}"),
+            Child(child /* a, et, cf, _ */) => write!(
+                f,
+                "join on {} with {}({})",
+                child.attr,
+                child.entity_type,
+                child.filter.to_string()
+            ),
+        }
+    }
 }
 
 // Define some convenience methods
@@ -287,7 +327,7 @@ pub enum EntityLink {
     /// The parent id is stored in this child attribute
     Direct(WindowAttribute, ChildMultiplicity),
     /// Join with the parents table to get at the parent id
-    Parent(ParentLink),
+    Parent(EntityType, ParentLink),
 }
 
 /// Window results of an `EntityQuery` query along the parent's id:
@@ -497,9 +537,9 @@ pub enum EntityChange {
 }
 
 impl EntityChange {
-    pub fn for_data(key: EntityKey) -> Self {
+    pub fn for_data(subgraph_id: DeploymentHash, key: EntityKey) -> Self {
         Self::Data {
-            subgraph_id: key.subgraph_id,
+            subgraph_id,
             entity_type: key.entity_type,
         }
     }
@@ -540,23 +580,6 @@ pub struct StoreEvent {
     pub changes: HashSet<EntityChange>,
 }
 
-impl<'a> FromIterator<&'a EntityModification> for StoreEvent {
-    fn from_iter<I: IntoIterator<Item = &'a EntityModification>>(mods: I) -> Self {
-        let changes: Vec<_> = mods
-            .into_iter()
-            .map(|op| {
-                use self::EntityModification::*;
-                match op {
-                    Insert { key, .. } | Overwrite { key, .. } | Remove { key } => {
-                        EntityChange::for_data(key.clone())
-                    }
-                }
-            })
-            .collect();
-        StoreEvent::new(changes)
-    }
-}
-
 impl StoreEvent {
     pub fn new(changes: Vec<EntityChange>) -> StoreEvent {
         static NEXT_TAG: AtomicUsize = AtomicUsize::new(0);
@@ -564,6 +587,24 @@ impl StoreEvent {
         let tag = NEXT_TAG.fetch_add(1, Ordering::Relaxed);
         let changes = changes.into_iter().collect();
         StoreEvent { tag, changes }
+    }
+
+    pub fn from_mods<'a, I: IntoIterator<Item = &'a EntityModification>>(
+        subgraph_id: &DeploymentHash,
+        mods: I,
+    ) -> Self {
+        let changes: Vec<_> = mods
+            .into_iter()
+            .map(|op| {
+                use self::EntityModification::*;
+                match op {
+                    Insert { key, .. } | Overwrite { key, .. } | Remove { key } => {
+                        EntityChange::for_data(subgraph_id.clone(), key.clone())
+                    }
+                }
+            })
+            .collect();
+        StoreEvent::new(changes)
     }
 
     /// Extend `ev1` with `ev2`. If `ev1` is `None`, just set it to `ev2`
@@ -753,12 +794,14 @@ pub enum UnfailOutcome {
     Unfailed,
 }
 
-#[derive(Clone)]
+#[derive(Clone, PartialEq, Eq, Debug)]
 pub struct StoredDynamicDataSource {
-    pub name: String,
-    pub source: Source,
-    pub context: Option<String>,
+    pub manifest_idx: u32,
+    pub param: Option<Bytes>,
+    pub context: Option<serde_json::Value>,
     pub creation_block: Option<BlockNumber>,
+    pub is_offchain: bool,
+    pub done_at: Option<i32>,
 }
 
 /// An internal identifer for the specific instance of a deployment. The
@@ -833,7 +876,7 @@ pub enum EntityModification {
 }
 
 impl EntityModification {
-    pub fn entity_key(&self) -> &EntityKey {
+    pub fn entity_ref(&self) -> &EntityKey {
         use EntityModification::*;
         match self {
             Insert { key, .. } | Overwrite { key, .. } | Remove { key } => key,
@@ -963,4 +1006,107 @@ impl From<BlockNumber> for PartialBlockPtr {
     fn from(number: BlockNumber) -> Self {
         Self { number, hash: None }
     }
+}
+
+#[derive(Copy, Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub enum DeploymentSchemaVersion {
+    /// V0, baseline version, in which:
+    /// - A relational schema is used.
+    /// - Each deployment has its own namespace for entity tables.
+    /// - Dynamic data sources are stored in `subgraphs.dynamic_ethereum_contract_data_source`.
+    V0 = 0,
+
+    /// V1: Dynamic data sources moved to `sgd*.data_sources$`.
+    V1 = 1,
+}
+
+impl DeploymentSchemaVersion {
+    // Latest schema version supported by this version of graph node.
+    pub const LATEST: Self = Self::V1;
+
+    pub fn private_data_sources(self) -> bool {
+        use DeploymentSchemaVersion::*;
+        match self {
+            V0 => false,
+            V1 => true,
+        }
+    }
+}
+
+impl TryFrom<i32> for DeploymentSchemaVersion {
+    type Error = StoreError;
+
+    fn try_from(value: i32) -> Result<Self, Self::Error> {
+        match value {
+            0 => Ok(Self::V0),
+            1 => Ok(Self::V1),
+            _ => Err(StoreError::UnsupportedDeploymentSchemaVersion(value)),
+        }
+    }
+}
+
+impl fmt::Display for DeploymentSchemaVersion {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        fmt::Display::fmt(&(*self as i32), f)
+    }
+}
+
+/// A `ReadStore` that is always empty.
+pub struct EmptyStore {
+    schema: Arc<Schema>,
+}
+
+impl EmptyStore {
+    pub fn new(schema: Arc<Schema>) -> Self {
+        EmptyStore { schema }
+    }
+}
+
+impl ReadStore for EmptyStore {
+    fn get(&self, _key: &EntityKey) -> Result<Option<Entity>, StoreError> {
+        Ok(None)
+    }
+
+    fn get_many(
+        &self,
+        _ids_for_type: BTreeMap<&EntityType, Vec<&str>>,
+    ) -> Result<BTreeMap<EntityType, Vec<Entity>>, StoreError> {
+        Ok(BTreeMap::new())
+    }
+
+    fn input_schema(&self) -> Arc<Schema> {
+        self.schema.cheap_clone()
+    }
+}
+
+/// An estimate of the number of entities and the number of entity versions
+/// in a database table
+#[derive(Clone, Debug)]
+pub struct VersionStats {
+    pub entities: i32,
+    pub versions: i32,
+    pub tablename: String,
+    /// The ratio `entities / versions`
+    pub ratio: f64,
+}
+
+/// Callbacks for `SubgraphStore.prune` so that callers can report progress
+/// of the pruning procedure to users
+#[allow(unused_variables)]
+pub trait PruneReporter: Send + 'static {
+    fn start_analyze(&mut self) {}
+    fn start_analyze_table(&mut self, table: &str) {}
+    fn finish_analyze_table(&mut self, table: &str) {}
+    fn finish_analyze(&mut self, stats: &[VersionStats]) {}
+
+    fn copy_final_start(&mut self, earliest_block: BlockNumber, final_block: BlockNumber) {}
+    fn copy_final_batch(&mut self, table: &str, rows: usize, total_rows: usize, finished: bool) {}
+    fn copy_final_finish(&mut self) {}
+
+    fn start_switch(&mut self) {}
+    fn copy_nonfinal_start(&mut self, table: &str) {}
+    fn copy_nonfinal_finish(&mut self, table: &str, rows: usize) {}
+    fn finish_switch(&mut self) {}
+
+    fn finish_prune(&mut self) {}
 }

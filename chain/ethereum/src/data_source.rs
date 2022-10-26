@@ -6,9 +6,8 @@ use graph::prelude::ethabi::ethereum_types::H160;
 use graph::prelude::ethabi::StateMutability;
 use graph::prelude::futures03::future::try_join;
 use graph::prelude::futures03::stream::FuturesOrdered;
-use graph::prelude::{Entity, Link, SubgraphManifestValidationError};
+use graph::prelude::{Link, SubgraphManifestValidationError};
 use graph::slog::{o, trace};
-use std::collections::BTreeMap;
 use std::str::FromStr;
 use std::{convert::TryFrom, sync::Arc};
 use tiny_keccak::{keccak256, Keccak};
@@ -41,7 +40,9 @@ pub struct DataSource {
     pub kind: String,
     pub network: Option<String>,
     pub name: String,
-    pub source: Source,
+    pub manifest_idx: u32,
+    pub address: Option<Address>,
+    pub start_block: BlockNumber,
     pub mapping: Mapping,
     pub context: Arc<Option<DataSourceContext>>,
     pub creation_block: Option<BlockNumber>,
@@ -50,11 +51,11 @@ pub struct DataSource {
 
 impl blockchain::DataSource<Chain> for DataSource {
     fn address(&self) -> Option<&[u8]> {
-        self.source.address.as_ref().map(|x| x.as_bytes())
+        self.address.as_ref().map(|x| x.as_bytes())
     }
 
     fn start_block(&self) -> BlockNumber {
-        self.source.start_block
+        self.start_block
     }
 
     fn match_and_decode(
@@ -92,14 +93,16 @@ impl blockchain::DataSource<Chain> for DataSource {
             kind,
             network,
             name,
-            source,
+            manifest_idx,
+            address,
             mapping,
             context,
 
             // The creation block is ignored for detection duplicate data sources.
-            // Contract ABI equality is implicit in `source` and `mapping.abis` equality.
+            // Contract ABI equality is implicit in `mapping.abis` equality.
             creation_block: _,
             contract_abi: _,
+            start_block: _,
         } = self;
 
         // mapping_request_sender, host_metrics, and (most of) host_exports are operational structs
@@ -108,7 +111,8 @@ impl blockchain::DataSource<Chain> for DataSource {
         kind == &other.kind
             && network == &other.network
             && name == &other.name
-            && source == &other.source
+            && manifest_idx == &other.manifest_idx
+            && address == &other.address
             && mapping.abis == other.mapping.abis
             && mapping.event_handlers == other.mapping.event_handlers
             && mapping.call_handlers == other.mapping.call_handlers
@@ -117,42 +121,52 @@ impl blockchain::DataSource<Chain> for DataSource {
     }
 
     fn as_stored_dynamic_data_source(&self) -> StoredDynamicDataSource {
+        let param = self.address.map(|addr| addr.0.into());
         StoredDynamicDataSource {
-            name: self.name.to_owned(),
-            source: self.source.clone(),
+            manifest_idx: self.manifest_idx,
+            param,
             context: self
                 .context
                 .as_ref()
                 .as_ref()
-                .map(|ctx| serde_json::to_string(&ctx).unwrap()),
+                .map(|ctx| serde_json::to_value(&ctx).unwrap()),
             creation_block: self.creation_block,
+            is_offchain: false,
+            done_at: None,
         }
     }
 
     fn from_stored_dynamic_data_source(
-        templates: &BTreeMap<&str, &DataSourceTemplate>,
+        template: &DataSourceTemplate,
         stored: StoredDynamicDataSource,
     ) -> Result<Self, Error> {
         let StoredDynamicDataSource {
-            name,
-            source,
+            manifest_idx,
+            param,
             context,
             creation_block,
+            is_offchain,
+            done_at,
         } = stored;
-        let template = templates
-            .get(name.as_str())
-            .ok_or_else(|| anyhow!("no template named `{}` was found", name))?;
-        let context = context
-            .map(|ctx| serde_json::from_str::<Entity>(&ctx))
-            .transpose()?;
+
+        ensure!(
+            !is_offchain,
+            "attempted to convert offchain data source to ethereum data source"
+        );
+        ensure!(done_at.is_none(), "onchain data sources are never done");
+
+        let context = context.map(serde_json::from_value).transpose()?;
 
         let contract_abi = template.mapping.find_abi(&template.source.abi)?;
 
+        let address = param.map(|x| H160::from_slice(&x));
         Ok(DataSource {
             kind: template.kind.to_string(),
             network: template.network.as_ref().map(|s| s.to_string()),
-            name,
-            source,
+            name: template.name.clone(),
+            manifest_idx,
+            address,
+            start_block: 0,
             mapping: template.mapping.clone(),
             context: Arc::new(context),
             creation_block,
@@ -219,8 +233,8 @@ impl blockchain::DataSource<Chain> for DataSource {
         self.mapping.api_version.clone()
     }
 
-    fn runtime(&self) -> &[u8] {
-        self.mapping.runtime.as_ref()
+    fn runtime(&self) -> Option<Arc<Vec<u8>>> {
+        Some(self.mapping.runtime.cheap_clone())
     }
 }
 
@@ -232,6 +246,7 @@ impl DataSource {
         source: Source,
         mapping: Mapping,
         context: Option<DataSourceContext>,
+        manifest_idx: u32,
     ) -> Result<Self, Error> {
         // Data sources in the manifest are created "before genesis" so they have no creation block.
         let creation_block = None;
@@ -243,7 +258,9 @@ impl DataSource {
             kind,
             network,
             name,
-            source,
+            manifest_idx,
+            address: source.address,
+            start_block: source.start_block,
             mapping,
             context: Arc::new(context),
             creation_block,
@@ -437,7 +454,7 @@ impl DataSource {
     }
 
     fn matches_trigger_address(&self, trigger: &EthereumTrigger) -> bool {
-        let ds_address = match self.source.address {
+        let ds_address = match self.address {
             Some(addr) => addr,
 
             // 'wildcard' data sources match any trigger address.
@@ -468,7 +485,7 @@ impl DataSource {
             return Ok(None);
         }
 
-        if self.source.start_block > block.number() {
+        if self.start_block > block.number() {
             return Ok(None);
         }
 
@@ -478,11 +495,12 @@ impl DataSource {
                     Some(handler) => handler,
                     None => return Ok(None),
                 };
-                Ok(Some(TriggerWithHandler::new(
+                Ok(Some(TriggerWithHandler::<Chain>::new(
                     MappingTrigger::Block {
                         block: block.cheap_clone(),
                     },
                     handler.handler,
+                    block.block_ptr(),
                 )))
             }
             EthereumTrigger::Log(log, receipt) => {
@@ -580,7 +598,7 @@ impl DataSource {
                     "address" => format!("{}", &log.address),
                     "transaction" => format!("{}", &transaction.hash),
                 });
-                Ok(Some(TriggerWithHandler::new_with_logging_extras(
+                Ok(Some(TriggerWithHandler::<Chain>::new_with_logging_extras(
                     MappingTrigger::Log {
                         block: block.cheap_clone(),
                         transaction: Arc::new(transaction),
@@ -589,6 +607,7 @@ impl DataSource {
                         receipt: receipt.clone(),
                     },
                     event_handler.handler,
+                    block.block_ptr(),
                     logging_extras,
                 )))
             }
@@ -627,6 +646,7 @@ impl DataSource {
                     },
                 ) {
                     Ok(val) => val,
+                    // See also 280b0108-a96e-4738-bb37-60ce11eeb5bf
                     Err(err) => {
                         warn!(logger, "Failed parsing inputs, skipping"; "error" => &err.to_string());
                         return Ok(None);
@@ -688,7 +708,7 @@ impl DataSource {
                     "to" => format!("{}", &call.to),
                     "transaction" => format!("{}", &transaction.hash),
                 });
-                Ok(Some(TriggerWithHandler::new_with_logging_extras(
+                Ok(Some(TriggerWithHandler::<Chain>::new_with_logging_extras(
                     MappingTrigger::Call {
                         block: block.cheap_clone(),
                         transaction,
@@ -697,6 +717,7 @@ impl DataSource {
                         outputs,
                     },
                     handler.handler,
+                    block.block_ptr(),
                     logging_extras,
                 )))
             }
@@ -720,6 +741,7 @@ impl blockchain::UnresolvedDataSource<Chain> for UnresolvedDataSource {
         self,
         resolver: &Arc<dyn LinkResolver>,
         logger: &Logger,
+        manifest_idx: u32,
     ) -> Result<DataSource, anyhow::Error> {
         let UnresolvedDataSource {
             kind,
@@ -734,7 +756,7 @@ impl blockchain::UnresolvedDataSource<Chain> for UnresolvedDataSource {
 
         let mapping = mapping.resolve(&*resolver, logger).await?;
 
-        DataSource::from_manifest(kind, network, name, source, mapping, context)
+        DataSource::from_manifest(kind, network, name, source, mapping, context, manifest_idx)
     }
 }
 
@@ -748,6 +770,9 @@ impl TryFrom<DataSourceTemplateInfo<Chain>> for DataSource {
             context,
             creation_block,
         } = info;
+        let template = template.into_onchain().ok_or(anyhow!(
+            "Cannot create onchain data source from offchain template"
+        ))?;
 
         // Obtain the address from the parameters
         let string = params
@@ -776,11 +801,9 @@ impl TryFrom<DataSourceTemplateInfo<Chain>> for DataSource {
             kind: template.kind,
             network: template.network,
             name: template.name,
-            source: Source {
-                address: Some(address),
-                abi: template.source.abi,
-                start_block: 0,
-            },
+            manifest_idx: template.manifest_idx,
+            address: Some(address),
+            start_block: 0,
             mapping: template.mapping,
             context: Arc::new(context),
             creation_block: Some(creation_block),
@@ -790,16 +813,23 @@ impl TryFrom<DataSourceTemplateInfo<Chain>> for DataSource {
 }
 
 #[derive(Clone, Debug, Default, Hash, Eq, PartialEq, Deserialize)]
-pub struct BaseDataSourceTemplate<M> {
+pub struct UnresolvedDataSourceTemplate {
     pub kind: String,
     pub network: Option<String>,
     pub name: String,
     pub source: TemplateSource,
-    pub mapping: M,
+    pub mapping: UnresolvedMapping,
 }
 
-pub type UnresolvedDataSourceTemplate = BaseDataSourceTemplate<UnresolvedMapping>;
-pub type DataSourceTemplate = BaseDataSourceTemplate<Mapping>;
+#[derive(Clone, Debug)]
+pub struct DataSourceTemplate {
+    pub kind: String,
+    pub network: Option<String>,
+    pub name: String,
+    pub manifest_idx: u32,
+    pub source: TemplateSource,
+    pub mapping: Mapping,
+}
 
 #[async_trait]
 impl blockchain::UnresolvedDataSourceTemplate<Chain> for UnresolvedDataSourceTemplate {
@@ -807,6 +837,7 @@ impl blockchain::UnresolvedDataSourceTemplate<Chain> for UnresolvedDataSourceTem
         self,
         resolver: &Arc<dyn LinkResolver>,
         logger: &Logger,
+        manifest_idx: u32,
     ) -> Result<DataSourceTemplate, anyhow::Error> {
         let UnresolvedDataSourceTemplate {
             kind,
@@ -822,6 +853,7 @@ impl blockchain::UnresolvedDataSourceTemplate<Chain> for UnresolvedDataSourceTem
             kind,
             network,
             name,
+            manifest_idx,
             source,
             mapping: mapping.resolve(resolver, logger).await?,
         })
@@ -837,8 +869,12 @@ impl blockchain::DataSourceTemplate<Chain> for DataSourceTemplate {
         self.mapping.api_version.clone()
     }
 
-    fn runtime(&self) -> &[u8] {
-        self.mapping.runtime.as_ref()
+    fn runtime(&self) -> Option<Arc<Vec<u8>>> {
+        Some(self.mapping.runtime.cheap_clone())
+    }
+
+    fn manifest_idx(&self) -> u32 {
+        self.manifest_idx
     }
 }
 

@@ -3,7 +3,9 @@ use semver::Version;
 
 use graph::{
     data::store,
-    runtime::{gas::GasCounter, AscHeap, AscIndexId, AscType, AscValue, IndexForAscTypeId},
+    runtime::{
+        gas::GasCounter, AscHeap, AscIndexId, AscType, AscValue, IndexForAscTypeId, ToAscObj,
+    },
 };
 use graph::{prelude::serde_json, runtime::DeterministicHostError};
 use graph::{prelude::slog, runtime::AscPtr};
@@ -137,7 +139,18 @@ impl<T> AscType for TypedArray<T> {
     }
 }
 
+pub struct Bytes<'a>(pub &'a Vec<u8>);
+
 pub type Uint8Array = TypedArray<u8>;
+impl ToAscObj<Uint8Array> for Bytes<'_> {
+    fn to_asc_obj<H: AscHeap + ?Sized>(
+        &self,
+        heap: &mut H,
+        gas: &GasCounter,
+    ) -> Result<Uint8Array, DeterministicHostError> {
+        self.0.to_asc_obj(heap, gas)
+    }
+}
 
 impl AscIndexId for TypedArray<i8> {
     const INDEX_ASC_TYPE_ID: IndexForAscTypeId = IndexForAscTypeId::Int8Array;
@@ -692,7 +705,7 @@ impl AscIndexId for AscResult<AscPtr<AscEnum<JsonValueKind>>, bool> {
 }
 
 #[repr(C)]
-#[derive(AscType)]
+#[derive(AscType, Copy, Clone)]
 pub struct AscWrapped<V: AscValue> {
     pub inner: V,
 }
@@ -707,12 +720,4 @@ impl AscIndexId for AscWrapped<bool> {
 
 impl AscIndexId for AscWrapped<AscPtr<AscEnum<JsonValueKind>>> {
     const INDEX_ASC_TYPE_ID: IndexForAscTypeId = IndexForAscTypeId::WrappedJsonValue;
-}
-
-impl<V: AscValue> Copy for AscWrapped<V> {}
-
-impl<V: AscValue> Clone for AscWrapped<V> {
-    fn clone(&self) -> Self {
-        Self { inner: self.inner }
-    }
 }

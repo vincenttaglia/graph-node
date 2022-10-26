@@ -14,6 +14,7 @@
 /docker/data/
 /docker/parity/chains/
 /docker/parity/network/
+**/*/tests/fixtures/ipfs_folder/random.txt
 
 /tests/integration-tests/**/build
 /tests/integration-tests/**/generated
@@ -23,5 +24,4 @@
 
 # Built solidity contracts.
 /tests/integration-tests/**/bin
-/tests/integration-tests/**/abis
 /tests/integration-tests/**/truffle_output

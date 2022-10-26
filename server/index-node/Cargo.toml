@@ -1,17 +1,18 @@
 [package]
 name = "graph-server-index-node"
-version = "0.26.0"
-edition = "2021"
+version.workspace = true
+edition.workspace = true
 
 [dependencies]
 blake3 = "1.0"
-either = "1.6.1"
+either = "1.8.0"
 futures = "0.3.4"
 graph = { path = "../../graph" }
 graph-graphql = { path = "../../graphql" }
+graph-chain-arweave = { path = "../../chain/arweave" }
 graph-chain-ethereum = { path = "../../chain/ethereum" }
 graph-chain-near = { path = "../../chain/near" }
-graph-chain-tendermint = { path = "../../chain/tendermint" }
+graph-chain-cosmos = { path = "../../chain/cosmos" }
 graphql-parser = "0.4.0"
 http = "0.2"
 hyper = "0.14"

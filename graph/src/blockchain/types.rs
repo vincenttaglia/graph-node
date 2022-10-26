@@ -1,6 +1,4 @@
-use anyhow::{anyhow, Context};
-use stable_hash::prelude::*;
-use stable_hash::utils::AsBytes;
+use anyhow::anyhow;
 use std::convert::TryFrom;
 use std::{fmt, str::FromStr};
 use web3::types::{Block, H256};
@@ -8,11 +6,14 @@ use web3::types::{Block, H256};
 use crate::data::graphql::IntoValue;
 use crate::object;
 use crate::prelude::{r, BigInt, TryFromValue, ValueMap};
+use crate::util::stable_hash_glue::{impl_stable_hash, AsBytes};
 use crate::{cheap_clone::CheapClone, components::store::BlockNumber};
 
 /// A simple marker for byte arrays that are really block hashes
 #[derive(Clone, Default, PartialEq, Eq, Hash)]
 pub struct BlockHash(pub Box<[u8]>);
+
+impl_stable_hash!(BlockHash(transparent: AsBytes));
 
 impl BlockHash {
     pub fn as_slice(&self) -> &[u8] {
@@ -44,6 +45,12 @@ impl fmt::Debug for BlockHash {
     }
 }
 
+impl fmt::LowerHex for BlockHash {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(&hex::encode(&self.0))
+    }
+}
+
 impl CheapClone for BlockHash {}
 
 impl From<H256> for BlockHash {
@@ -63,10 +70,17 @@ impl TryFrom<&str> for BlockHash {
 
     fn try_from(hash: &str) -> Result<Self, Self::Error> {
         let hash = hash.trim_start_matches("0x");
-        let hash = hex::decode(hash)
-            .with_context(|| format!("Cannot parse H256 value from string `{}`", hash))?;
+        let hash = hex::decode(hash)?;
 
         Ok(BlockHash(hash.as_slice().into()))
+    }
+}
+
+impl FromStr for BlockHash {
+    type Err = anyhow::Error;
+
+    fn from_str(hash: &str) -> Result<Self, Self::Err> {
+        Self::try_from(hash)
     }
 }
 
@@ -81,12 +95,7 @@ pub struct BlockPtr {
 
 impl CheapClone for BlockPtr {}
 
-impl StableHash for BlockPtr {
-    fn stable_hash<H: StableHasher>(&self, mut sequence_number: H::Seq, state: &mut H) {
-        AsBytes(self.hash.0.as_ref()).stable_hash(sequence_number.next_child(), state);
-        self.number.stable_hash(sequence_number.next_child(), state);
-    }
-}
+impl_stable_hash!(BlockPtr { hash, number });
 
 impl BlockPtr {
     pub fn new(hash: BlockHash, number: BlockNumber) -> Self {
@@ -104,8 +113,11 @@ impl BlockPtr {
         self.number
     }
 
+    // FIXME:
+    //
+    // workaround for arweave
     pub fn hash_as_h256(&self) -> H256 {
-        H256::from_slice(self.hash_slice())
+        H256::from_slice(&self.hash_slice()[..32])
     }
 
     pub fn hash_slice(&self) -> &[u8] {
@@ -199,10 +211,9 @@ impl TryFrom<(&str, i64)> for BlockPtr {
 
     fn try_from((hash, number): (&str, i64)) -> Result<Self, Self::Error> {
         let hash = hash.trim_start_matches("0x");
-        let hash = H256::from_str(hash)
-            .map_err(|e| anyhow!("Cannot parse H256 value from string `{}`: {}", hash, e))?;
+        let hash = BlockHash::from_str(hash)?;
 
-        Ok(BlockPtr::from((hash, number)))
+        Ok(BlockPtr::new(hash, number as i32))
     }
 }
 
@@ -229,9 +240,9 @@ impl TryFromValue for BlockPtr {
         match value {
             r::Value::Object(o) => {
                 let number = o.get_required::<BigInt>("number")?.to_u64() as BlockNumber;
-                let hash = o.get_required::<H256>("hash")?;
+                let hash = o.get_required::<BlockHash>("hash")?;
 
-                Ok(BlockPtr::from((hash, number)))
+                Ok(BlockPtr::new(hash, number))
             }
             _ => Err(anyhow!(
                 "failed to parse non-object value into BlockPtr: {:?}",

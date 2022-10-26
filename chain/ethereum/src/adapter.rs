@@ -3,12 +3,9 @@ use ethabi::{Error as ABIError, Function, ParamType, Token};
 use futures::Future;
 use graph::blockchain::ChainIdentifier;
 use graph::firehose::CallToFilter;
+use graph::firehose::CombinedFilter;
 use graph::firehose::LogFilter;
-use graph::firehose::MultiCallToFilter;
-use graph::firehose::MultiLogFilter;
 use itertools::Itertools;
-use mockall::automock;
-use mockall::predicate::*;
 use prost::Message;
 use prost_types::Any;
 use std::cmp;
@@ -26,10 +23,8 @@ use graph::{
     petgraph::{self, graphmap::GraphMap},
 };
 
-const MULTI_LOG_FILTER_TYPE_URL: &str =
-    "type.googleapis.com/sf.ethereum.transform.v1.MultiLogFilter";
-const MULTI_CALL_TO_FILTER_TYPE_URL: &str =
-    "type.googleapis.com/sf.ethereum.transform.v1.MultiCallToFilter";
+const COMBINED_FILTER_TYPE_URL: &str =
+    "type.googleapis.com/sf.ethereum.transform.v1.CombinedFilter";
 
 use crate::capabilities::NodeCapabilities;
 use crate::data_source::{BlockHandlerFilter, DataSource};
@@ -49,7 +44,7 @@ pub struct EthereumContractCall {
 #[derive(Error, Debug)]
 pub enum EthereumContractCallError {
     #[error("ABI error: {0}")]
-    ABIError(ABIError),
+    ABIError(#[from] ABIError),
     /// `Token` is not of expected `ParamType`
     #[error("type mismatch, token {0:?} is not of kind {1:?}")]
     TypeError(Token, ParamType),
@@ -61,12 +56,6 @@ pub enum EthereumContractCallError {
     Revert(String),
     #[error("ethereum node took too long to perform call")]
     Timeout,
-}
-
-impl From<ABIError> for EthereumContractCallError {
-    fn from(e: ABIError) -> Self {
-        EthereumContractCallError::ABIError(e)
-    }
 }
 
 #[derive(Copy, Clone, Debug, PartialEq, Eq, Ord, PartialOrd, Hash)]
@@ -172,31 +161,24 @@ impl bc::TriggerFilter<Chain> for TriggerFilter {
             trigger_every_block,
         } = self.block.clone();
 
-        if trigger_every_block {
-            return Vec::new();
-        }
-
-        let mut filters = vec![];
-
+        let log_filters: Vec<LogFilter> = self.log.into();
         let mut call_filters: Vec<CallToFilter> = self.call.into();
         call_filters.extend(Into::<Vec<CallToFilter>>::into(self.block));
 
-        if !call_filters.is_empty() {
-            filters.push(Any {
-                type_url: MULTI_CALL_TO_FILTER_TYPE_URL.into(),
-                value: MultiCallToFilter { call_filters }.encode_to_vec(),
-            });
+        if call_filters.is_empty() && log_filters.is_empty() && !trigger_every_block {
+            return Vec::new();
         }
 
-        let log_filters: Vec<LogFilter> = self.log.into();
-        if !log_filters.is_empty() {
-            filters.push(Any {
-                type_url: MULTI_LOG_FILTER_TYPE_URL.into(),
-                value: MultiLogFilter { log_filters }.encode_to_vec(),
-            })
-        }
+        let combined_filter = CombinedFilter {
+            log_filters,
+            call_filters,
+            send_all_block_headers: trigger_every_block,
+        };
 
-        filters
+        vec![Any {
+            type_url: COMBINED_FILTER_TYPE_URL.into(),
+            value: combined_filter.encode_to_vec(),
+        }]
     }
 }
 
@@ -282,7 +264,7 @@ impl EthereumLogFilter {
         for ds in iter {
             for event_handler in ds.mapping.event_handlers.iter() {
                 let event_sig = event_handler.topic0();
-                match ds.source.address {
+                match ds.address {
                     Some(contract) => {
                         this.contracts_and_events_graph.add_edge(
                             LogFilterNode::Contract(contract),
@@ -452,22 +434,11 @@ impl EthereumCallFilter {
             return false;
         }
 
-        // Make sure the call input size is multiple of 32, otherwise we can't decode it.
-        // This is due to the Ethereum ABI spec: https://docs.soliditylang.org/en/v0.8.11/abi-spec.html
+        // The `call.input.len()` is validated in the
+        // DataSource::match_and_decode function.
+        // Those calls are logged as warning and skipped.
         //
-        // A scenario where the input could have the wrong size is when a `delegatecall` is
-        // "disguised" as a `call`. For example for this couple of transactions/calls:
-        // 1. https://etherscan.io/tx/0x8e992eeb40e18703dd8169a8031e2113311985f1c20e0723a2dc362df40bafb0
-        // 2. https://etherscan.io/tx/0x7c391bcfa2007f84e123ad47ea72e2d6ffb2fbab81deff0990b0c499e0664a92
-        //
-        // The first one is acting as a proxy to the second one (an atomicMatch_).
-        // If you try to decode the first call as it is/comes from a `traces` RPC request, it
-        // will fail because it has a smaller size/length.
-        let correct_input_size = (call.input.0.len() - 4) % 32 == 0;
-        if !correct_input_size {
-            return false;
-        }
-
+        // See 280b0108-a96e-4738-bb37-60ce11eeb5bf
         let call_signature = &call.input.0[..4];
 
         // Ensure the call is to a contract the filter expressed an interest in
@@ -508,9 +479,9 @@ impl EthereumCallFilter {
 
     pub fn from_data_sources<'a>(iter: impl IntoIterator<Item = &'a DataSource>) -> Self {
         iter.into_iter()
-            .filter_map(|data_source| data_source.source.address.map(|addr| (addr, data_source)))
+            .filter_map(|data_source| data_source.address.map(|addr| (addr, data_source)))
             .map(|(contract_addr, data_source)| {
-                let start_block = data_source.source.start_block;
+                let start_block = data_source.start_block;
                 data_source
                     .mapping
                     .call_handlers
@@ -645,7 +616,7 @@ impl EthereumBlockFilter {
 
     pub fn from_data_sources<'a>(iter: impl IntoIterator<Item = &'a DataSource>) -> Self {
         iter.into_iter()
-            .filter(|data_source| data_source.source.address.is_some())
+            .filter(|data_source| data_source.address.is_some())
             .fold(Self::default(), |mut filter_opt, data_source| {
                 let has_block_handler_with_call_filter = data_source
                     .mapping
@@ -668,8 +639,8 @@ impl EthereumBlockFilter {
                     trigger_every_block: has_block_handler_without_filter,
                     contract_addresses: if has_block_handler_with_call_filter {
                         vec![(
-                            data_source.source.start_block,
-                            data_source.source.address.unwrap().to_owned(),
+                            data_source.start_block,
+                            data_source.address.unwrap().to_owned(),
                         )]
                         .into_iter()
                         .collect()
@@ -692,24 +663,25 @@ impl EthereumBlockFilter {
         } = other;
 
         self.trigger_every_block = self.trigger_every_block || trigger_every_block;
-        self.contract_addresses = self.contract_addresses.iter().cloned().fold(
-            HashSet::new(),
-            |mut addresses, (start_block, address)| {
-                match contract_addresses
-                    .iter()
-                    .cloned()
-                    .find(|(_, other_address)| &address == other_address)
-                {
-                    Some((other_start_block, address)) => {
-                        addresses.insert((cmp::min(other_start_block, start_block), address));
-                    }
-                    None => {
-                        addresses.insert((start_block, address));
+
+        for other in contract_addresses {
+            let (other_start_block, other_address) = other;
+
+            match self.find_contract_address(&other.1) {
+                Some((current_start_block, current_address)) => {
+                    if other_start_block < current_start_block {
+                        self.contract_addresses
+                            .remove(&(current_start_block, current_address));
+                        self.contract_addresses
+                            .insert((other_start_block, other_address));
                     }
                 }
-                addresses
-            },
-        );
+                None => {
+                    self.contract_addresses
+                        .insert((other_start_block, other_address));
+                }
+            }
+        }
     }
 
     fn requires_traces(&self) -> bool {
@@ -724,6 +696,13 @@ impl EthereumBlockFilter {
         }
 
         self.contract_addresses.is_empty()
+    }
+
+    fn find_contract_address(&self, candidate: &Address) -> Option<(i32, Address)> {
+        self.contract_addresses
+            .iter()
+            .find(|(_, current_address)| candidate == current_address)
+            .cloned()
     }
 }
 
@@ -756,7 +735,7 @@ pub struct ProviderEthRpcMetrics {
 }
 
 impl ProviderEthRpcMetrics {
-    pub fn new(registry: Arc<impl MetricsRegistry>) -> Self {
+    pub fn new(registry: Arc<dyn MetricsRegistry>) -> Self {
         let request_duration = registry
             .new_histogram_vec(
                 "eth_rpc_request_duration",
@@ -851,7 +830,6 @@ impl SubgraphEthRpcMetrics {
 ///
 /// Implementations may be implemented against an in-process Ethereum node
 /// or a remote node over RPC.
-#[automock]
 #[async_trait]
 pub trait EthereumAdapter: Send + Sync + 'static {
     fn url_hostname(&self) -> &str;
@@ -943,16 +921,13 @@ pub trait EthereumAdapter: Send + Sync + 'static {
 
 #[cfg(test)]
 mod tests {
-    use crate::adapter::FunctionSelector;
+    use crate::adapter::{FunctionSelector, COMBINED_FILTER_TYPE_URL};
 
-    use super::{
-        EthereumBlockFilter, LogFilterNode, MULTI_CALL_TO_FILTER_TYPE_URL,
-        MULTI_LOG_FILTER_TYPE_URL,
-    };
+    use super::{EthereumBlockFilter, LogFilterNode};
     use super::{EthereumCallFilter, EthereumLogFilter, TriggerFilter};
 
     use graph::blockchain::TriggerFilter as _;
-    use graph::firehose::{CallToFilter, LogFilter, MultiCallToFilter, MultiLogFilter};
+    use graph::firehose::{CallToFilter, CombinedFilter, LogFilter, MultiLogFilter};
     use graph::petgraph::graphmap::GraphMap;
     use graph::prelude::ethabi::ethereum_types::H256;
     use graph::prelude::web3::types::Address;
@@ -1074,37 +1049,32 @@ mod tests {
             },
         };
 
-        let expected_call = MultiCallToFilter {
-            call_filters: vec![
-                CallToFilter {
-                    addresses: vec![address(0).to_fixed_bytes().to_vec()],
-                    signatures: vec![[0u8; 4].to_vec()],
-                },
-                CallToFilter {
-                    addresses: vec![address(1).to_fixed_bytes().to_vec()],
-                    signatures: vec![[1u8; 4].to_vec()],
-                },
-                CallToFilter {
-                    addresses: vec![address(2).to_fixed_bytes().to_vec()],
-                    signatures: vec![],
-                },
-                CallToFilter {
-                    addresses: vec![address(1000).to_fixed_bytes().to_vec()],
-                    signatures: vec![],
-                },
-                CallToFilter {
-                    addresses: vec![address(2000).to_fixed_bytes().to_vec()],
-                    signatures: vec![],
-                },
-                CallToFilter {
-                    addresses: vec![address(3000).to_fixed_bytes().to_vec()],
-                    signatures: vec![],
-                },
-            ],
-        };
-        let mut bs = &expected_call.encode_to_vec()[..];
-        let expected_call =
-            MultiCallToFilter::decode(&mut bs).expect("unable to decode multi call_to filter");
+        let expected_call_filters = vec![
+            CallToFilter {
+                addresses: vec![address(0).to_fixed_bytes().to_vec()],
+                signatures: vec![[0u8; 4].to_vec()],
+            },
+            CallToFilter {
+                addresses: vec![address(1).to_fixed_bytes().to_vec()],
+                signatures: vec![[1u8; 4].to_vec()],
+            },
+            CallToFilter {
+                addresses: vec![address(2).to_fixed_bytes().to_vec()],
+                signatures: vec![],
+            },
+            CallToFilter {
+                addresses: vec![address(1000).to_fixed_bytes().to_vec()],
+                signatures: vec![],
+            },
+            CallToFilter {
+                addresses: vec![address(2000).to_fixed_bytes().to_vec()],
+                signatures: vec![],
+            },
+            CallToFilter {
+                addresses: vec![address(3000).to_fixed_bytes().to_vec()],
+                signatures: vec![],
+            },
+        ];
 
         filter.log.contracts_and_events_graph.add_edge(
             LogFilterNode::Contract(address(10)),
@@ -1122,28 +1092,22 @@ mod tests {
             false,
         );
 
-        let expected_log = MultiLogFilter {
-            log_filters: vec![
-                LogFilter {
-                    addresses: vec![address(10).to_fixed_bytes().to_vec()],
-                    event_signatures: vec![sig(101).to_fixed_bytes().to_vec()],
-                },
-                LogFilter {
-                    addresses: vec![
-                        address(10).to_fixed_bytes().to_vec(),
-                        address(20).to_fixed_bytes().to_vec(),
-                    ],
-                    event_signatures: vec![sig(100).to_fixed_bytes().to_vec()],
-                },
-            ],
-        };
-
-        let mut bs = &expected_log.encode_to_vec()[..];
-        let expected_log =
-            MultiLogFilter::decode(&mut bs).expect("unable to decode multi log filter");
+        let expected_log_filters = vec![
+            LogFilter {
+                addresses: vec![address(10).to_fixed_bytes().to_vec()],
+                event_signatures: vec![sig(101).to_fixed_bytes().to_vec()],
+            },
+            LogFilter {
+                addresses: vec![
+                    address(10).to_fixed_bytes().to_vec(),
+                    address(20).to_fixed_bytes().to_vec(),
+                ],
+                event_signatures: vec![sig(100).to_fixed_bytes().to_vec()],
+            },
+        ];
 
         let firehose_filter = filter.clone().to_firehose_filter();
-        assert_eq!(2, firehose_filter.len());
+        assert_eq!(1, firehose_filter.len());
 
         let firehose_filter: HashMap<_, _> = HashMap::from_iter::<Vec<(String, Any)>>(
             firehose_filter
@@ -1151,45 +1115,102 @@ mod tests {
                 .map(|any| (any.type_url.clone(), any))
                 .collect_vec(),
         );
-        let mut actual_call_filter = &firehose_filter
-            .get(MULTI_CALL_TO_FILTER_TYPE_URL.into())
-            .unwrap()
+
+        let mut combined_filter = &firehose_filter
+            .get(COMBINED_FILTER_TYPE_URL.into())
+            .expect("a CombinedFilter")
             .value[..];
 
-        let mut actual_log_filter = &firehose_filter
-            .get(MULTI_LOG_FILTER_TYPE_URL.into())
-            .unwrap()
-            .value[..];
+        let combined_filter =
+            CombinedFilter::decode(&mut combined_filter).expect("combined filter to decode");
 
-        let mut actual_call_filter = MultiCallToFilter::decode(&mut actual_call_filter)
-            .expect("unable to decode multi call filter");
-        actual_call_filter
-            .call_filters
-            .sort_by(|a, b| a.addresses.cmp(&b.addresses));
-        for filter in actual_call_filter.call_filters.iter_mut() {
+        let CombinedFilter {
+            log_filters: mut actual_log_filters,
+            call_filters: mut actual_call_filters,
+            send_all_block_headers: actual_send_all_block_headers,
+        } = combined_filter;
+
+        actual_call_filters.sort_by(|a, b| a.addresses.cmp(&b.addresses));
+        for filter in actual_call_filters.iter_mut() {
             filter.signatures.sort();
         }
-        assert_eq!(expected_call, actual_call_filter);
+        assert_eq!(expected_call_filters, actual_call_filters);
 
-        let mut actual_log_filter = MultiLogFilter::decode(&mut actual_log_filter)
-            .expect("unable to decode multi log filter");
-        actual_log_filter
-            .log_filters
-            .sort_by(|a, b| a.addresses.cmp(&b.addresses));
-        for filter in actual_log_filter.log_filters.iter_mut() {
+        actual_log_filters.sort_by(|a, b| a.addresses.cmp(&b.addresses));
+        for filter in actual_log_filters.iter_mut() {
             filter.event_signatures.sort();
         }
-        assert_eq!(expected_log, actual_log_filter);
+        assert_eq!(expected_log_filters, actual_log_filters);
+        assert_eq!(false, actual_send_all_block_headers);
+    }
 
-        filter.block.trigger_every_block = true;
-        let firehose_filter = filter.to_firehose_filter();
-        assert_eq!(firehose_filter.len(), 0);
+    #[test]
+    fn ethereum_trigger_filter_to_firehose_every_block_plus_logfilter() {
+        let address = Address::from_low_u64_be;
+        let sig = H256::from_low_u64_le;
+        let mut filter = TriggerFilter {
+            log: EthereumLogFilter {
+                contracts_and_events_graph: GraphMap::new(),
+                wildcard_events: HashMap::new(),
+            },
+            call: EthereumCallFilter {
+                contract_addresses_function_signatures: HashMap::new(),
+                wildcard_signatures: HashSet::new(),
+            },
+            block: EthereumBlockFilter {
+                contract_addresses: HashSet::new(),
+                trigger_every_block: true,
+            },
+        };
+
+        filter.log.contracts_and_events_graph.add_edge(
+            LogFilterNode::Contract(address(10)),
+            LogFilterNode::Event(sig(101)),
+            false,
+        );
+
+        let expected_log_filters = vec![LogFilter {
+            addresses: vec![address(10).to_fixed_bytes().to_vec()],
+            event_signatures: vec![sig(101).to_fixed_bytes().to_vec()],
+        }];
+
+        let firehose_filter = filter.clone().to_firehose_filter();
+        assert_eq!(1, firehose_filter.len());
+
+        let firehose_filter: HashMap<_, _> = HashMap::from_iter::<Vec<(String, Any)>>(
+            firehose_filter
+                .into_iter()
+                .map(|any| (any.type_url.clone(), any))
+                .collect_vec(),
+        );
+
+        let mut combined_filter = &firehose_filter
+            .get(COMBINED_FILTER_TYPE_URL.into())
+            .expect("a CombinedFilter")
+            .value[..];
+
+        let combined_filter =
+            CombinedFilter::decode(&mut combined_filter).expect("combined filter to decode");
+
+        let CombinedFilter {
+            log_filters: mut actual_log_filters,
+            call_filters: actual_call_filters,
+            send_all_block_headers: actual_send_all_block_headers,
+        } = combined_filter;
+
+        assert_eq!(0, actual_call_filters.len());
+
+        actual_log_filters.sort_by(|a, b| a.addresses.cmp(&b.addresses));
+        for filter in actual_log_filters.iter_mut() {
+            filter.event_signatures.sort();
+        }
+        assert_eq!(expected_log_filters, actual_log_filters);
+
+        assert_eq!(true, actual_send_all_block_headers);
     }
 
     #[test]
     fn matching_ethereum_call_filter() {
-        let address = |id: u64| Address::from_low_u64_be(id);
-        let bytes = |value: Vec<u8>| Bytes::from(value);
         let call = |to: Address, input: Vec<u8>| EthereumCall {
             to,
             input: bytes(input),
@@ -1231,9 +1252,9 @@ mod tests {
         );
 
         assert_eq!(
-            false,
+            true,
             filter.matches(&call(address(1), vec![1; 32])),
-            "call with correct address & signature, but with incorrect input size should be ignored"
+            "call with correct address & signature, but with incorrect input size should match"
         );
 
         assert_eq!(
@@ -1288,6 +1309,125 @@ mod tests {
     }
 
     #[test]
+    fn extending_ethereum_block_filter_no_found() {
+        let mut base = EthereumBlockFilter {
+            contract_addresses: HashSet::new(),
+            trigger_every_block: false,
+        };
+
+        let extension = EthereumBlockFilter {
+            contract_addresses: HashSet::from_iter(vec![(10, address(1))]),
+            trigger_every_block: false,
+        };
+
+        base.extend(extension);
+
+        assert_eq!(
+            HashSet::from_iter(vec![(10, address(1))]),
+            base.contract_addresses,
+        );
+    }
+
+    #[test]
+    fn extending_ethereum_block_filter_conflict_picks_lowest_block_from_ext() {
+        let mut base = EthereumBlockFilter {
+            contract_addresses: HashSet::from_iter(vec![(10, address(1))]),
+            trigger_every_block: false,
+        };
+
+        let extension = EthereumBlockFilter {
+            contract_addresses: HashSet::from_iter(vec![(2, address(1))]),
+            trigger_every_block: false,
+        };
+
+        base.extend(extension);
+
+        assert_eq!(
+            HashSet::from_iter(vec![(2, address(1))]),
+            base.contract_addresses,
+        );
+    }
+
+    #[test]
+    fn extending_ethereum_block_filter_conflict_picks_lowest_block_from_base() {
+        let mut base = EthereumBlockFilter {
+            contract_addresses: HashSet::from_iter(vec![(2, address(1))]),
+            trigger_every_block: false,
+        };
+
+        let extension = EthereumBlockFilter {
+            contract_addresses: HashSet::from_iter(vec![(10, address(1))]),
+            trigger_every_block: false,
+        };
+
+        base.extend(extension);
+
+        assert_eq!(
+            HashSet::from_iter(vec![(2, address(1))]),
+            base.contract_addresses,
+        );
+    }
+
+    #[test]
+    fn extending_ethereum_block_filter_every_block_in_ext() {
+        let mut base = EthereumBlockFilter {
+            contract_addresses: HashSet::default(),
+            trigger_every_block: false,
+        };
+
+        let extension = EthereumBlockFilter {
+            contract_addresses: HashSet::default(),
+            trigger_every_block: true,
+        };
+
+        base.extend(extension);
+
+        assert_eq!(true, base.trigger_every_block);
+    }
+
+    #[test]
+    fn extending_ethereum_block_filter_every_block_in_base_and_merge_contract_addresses() {
+        let mut base = EthereumBlockFilter {
+            contract_addresses: HashSet::from_iter(vec![(10, address(2))]),
+            trigger_every_block: true,
+        };
+
+        let extension = EthereumBlockFilter {
+            contract_addresses: HashSet::from_iter(vec![]),
+            trigger_every_block: false,
+        };
+
+        base.extend(extension);
+
+        assert_eq!(true, base.trigger_every_block);
+        assert_eq!(
+            HashSet::from_iter(vec![(10, address(2))]),
+            base.contract_addresses,
+        );
+    }
+
+    #[test]
+    fn extending_ethereum_block_filter_every_block_in_ext_and_merge_contract_addresses() {
+        let mut base = EthereumBlockFilter {
+            contract_addresses: HashSet::from_iter(vec![(10, address(2))]),
+            trigger_every_block: false,
+        };
+
+        let extension = EthereumBlockFilter {
+            contract_addresses: HashSet::from_iter(vec![(10, address(1))]),
+            trigger_every_block: true,
+        };
+
+        base.extend(extension);
+
+        assert_eq!(true, base.trigger_every_block);
+        assert_eq!(
+            HashSet::from_iter(vec![(10, address(2)), (10, address(1))]),
+            base.contract_addresses,
+        );
+    }
+
+    #[test]
     fn extending_ethereum_call_filter() {
         let mut base = EthereumCallFilter {
             contract_addresses_function_signatures: HashMap::from_iter(vec![
@@ -1332,6 +1472,14 @@ mod tests {
                 .get(&Address::from_low_u64_be(1)),
             Some(&(1, HashSet::from_iter(vec![[1u8; 4]])))
         );
+    }
+
+    fn address(id: u64) -> Address {
+        Address::from_low_u64_be(id)
+    }
+
+    fn bytes(value: Vec<u8>) -> Bytes {
+        Bytes::from(value)
     }
 }
 

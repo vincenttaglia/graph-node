@@ -39,10 +39,12 @@ type Query {
   subgraphFeatures(subgraphId: String!): SubgraphFeatures!
   entityChangesInBlock(subgraphId: String!, blockNumber: Int!): EntityChanges!
   blockData(network: String!, blockHash: Bytes!): JSONObject
+  blockHashFromNumber(network: String!, blockNumber: Int!): Bytes
   cachedEthereumCalls(
     network: String!
     blockHash: Bytes!
   ): [CachedEthereumCall!]
+  apiVersions(subgraphId: String!): [ApiVersion!]!
 }
 
 type SubgraphIndexingStatus {
@@ -68,7 +70,7 @@ type SubgraphIndexingStatus {
 interface ChainIndexingStatus {
   network: String!
   chainHeadBlock: Block
-  earliestBlock: Block
+  earliestBlock: EarliestBlock
   latestBlock: Block
   lastHealthyBlock: Block
 }
@@ -76,7 +78,7 @@ interface ChainIndexingStatus {
 type EthereumIndexingStatus implements ChainIndexingStatus {
   network: String!
   chainHeadBlock: Block
-  earliestBlock: Block
+  earliestBlock: EarliestBlock
   latestBlock: Block
   lastHealthyBlock: Block
 }
@@ -98,6 +100,11 @@ type EntityTypeDeletions {
 
 type Block {
   hash: Bytes!
+  number: BigInt!
+}
+
+type EarliestBlock {
+  hash: Bytes! @deprecated(reason: "hash will always be reported as 0x0.")
   number: BigInt!
 }
 
@@ -172,4 +179,11 @@ type ProofOfIndexingResult {
   block: Block!
   "There may not be a proof of indexing available for the deployment and block"
   proofOfIndexing: Bytes
+}
+
+type ApiVersion {
+  """
+  Version number in SemVer format
+  """
+  version: String!
 }

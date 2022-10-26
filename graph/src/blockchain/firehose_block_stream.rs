@@ -1,17 +1,17 @@
+use super::block_stream::{BlockStream, BlockStreamEvent, FirehoseMapper};
+use super::{Blockchain, TriggersAdapter};
+use crate::blockchain::block_stream::FirehoseCursor;
+use crate::blockchain::TriggerFilter;
+use crate::firehose::ForkStep::*;
+use crate::prelude::*;
+use crate::util::backoff::ExponentialBackoff;
+use crate::{firehose, firehose::FirehoseEndpoint};
 use async_stream::try_stream;
 use futures03::{Stream, StreamExt};
 use std::sync::Arc;
 use std::task::{Context, Poll};
 use std::time::{Duration, Instant};
 use tonic::Status;
-
-use crate::blockchain::TriggerFilter;
-use crate::prelude::*;
-use crate::util::backoff::ExponentialBackoff;
-
-use super::block_stream::{BlockStream, BlockStreamEvent, FirehoseMapper};
-use super::Blockchain;
-use crate::{firehose, firehose::FirehoseEndpoint};
 
 struct FirehoseBlockStreamMetrics {
     deployment: DeploymentHash,
@@ -68,7 +68,8 @@ impl FirehoseBlockStreamMetrics {
 
     fn observe_successful_connection(&self, time: &mut Instant) {
         self.restarts
-            .with_label_values(&[&self.deployment, &self.provider, "true"]);
+            .with_label_values(&[&self.deployment, &self.provider, "true"])
+            .inc();
         self.connect_duration
             .with_label_values(&[&self.deployment, &self.provider])
             .set(time.elapsed().as_secs_f64());
@@ -79,7 +80,8 @@ impl FirehoseBlockStreamMetrics {
 
     fn observe_failed_connection(&self, time: &mut Instant) {
         self.restarts
-            .with_label_values(&[&self.deployment, &self.provider, "false"]);
+            .with_label_values(&[&self.deployment, &self.provider, "false"])
+            .inc();
         self.connect_duration
             .with_label_values(&[&self.deployment, &self.provider])
             .set(time.elapsed().as_secs_f64());
@@ -113,9 +115,9 @@ where
         deployment: DeploymentHash,
         endpoint: Arc<FirehoseEndpoint>,
         subgraph_current_block: Option<BlockPtr>,
-        cursor: Option<String>,
+        cursor: FirehoseCursor,
         mapper: Arc<F>,
-        adapter: Arc<C::TriggersAdapter>,
+        adapter: Arc<dyn TriggersAdapter<C>>,
         filter: Arc<C::TriggerFilter>,
         start_blocks: Vec<BlockNumber>,
         logger: Logger,
@@ -152,19 +154,15 @@ where
 
 fn stream_blocks<C: Blockchain, F: FirehoseMapper<C>>(
     endpoint: Arc<FirehoseEndpoint>,
-    cursor: Option<String>,
+    mut latest_cursor: FirehoseCursor,
     mapper: Arc<F>,
-    adapter: Arc<C::TriggersAdapter>,
+    adapter: Arc<dyn TriggersAdapter<C>>,
     filter: Arc<C::TriggerFilter>,
     manifest_start_block_num: BlockNumber,
     subgraph_current_block: Option<BlockPtr>,
     logger: Logger,
     metrics: FirehoseBlockStreamMetrics,
 ) -> impl Stream<Item = Result<BlockStreamEvent<C>, Error>> {
-    use firehose::ForkStep::*;
-
-    let mut latest_cursor = cursor.unwrap_or_else(|| "".to_string());
-    let mut backoff = ExponentialBackoff::new(Duration::from_millis(500), Duration::from_secs(45));
     let mut subgraph_current_block = subgraph_current_block;
     let mut start_block_num = subgraph_current_block
         .as_ref()
@@ -175,10 +173,6 @@ fn stream_blocks<C: Blockchain, F: FirehoseMapper<C>>(
             ptr.block_number() + 1 as BlockNumber
         })
         .unwrap_or(manifest_start_block_num);
-
-    // Seems the `try_stream!` macro interfer and don't see we are actually reading/writing this
-    #[allow(unused_assignments)]
-    let mut skip_backoff = false;
 
     // Sanity check when starting from a subgraph block ptr directly. When
     // this happens, we must ensure that Firehose first picked block directly follows the
@@ -215,6 +209,13 @@ fn stream_blocks<C: Blockchain, F: FirehoseMapper<C>>(
         debug!(&logger, "Going to check continuity of chain on first block");
     }
 
+    // Back off exponentially whenever we encounter a connection error or a stream with bad data
+    let mut backoff = ExponentialBackoff::new(Duration::from_millis(500), Duration::from_secs(45));
+
+    // This attribute is needed because `try_stream!` seems to break detection of `skip_backoff` assignments
+    #[allow(unused_assignments)]
+    let mut skip_backoff = false;
+
     try_stream! {
         loop {
             info!(
@@ -222,13 +223,15 @@ fn stream_blocks<C: Blockchain, F: FirehoseMapper<C>>(
                 "Blockstream disconnected, connecting";
                 "endpoint_uri" => format_args!("{}", endpoint),
                 "start_block" => start_block_num,
-                "cursor" => &latest_cursor,
+                "cursor" => latest_cursor.to_string(),
             );
+
+            // We just reconnected, assume that we want to back off on errors
             skip_backoff = false;
 
             let mut request = firehose::Request {
                 start_block_num: start_block_num as i64,
-                start_cursor: latest_cursor.clone(),
+                start_cursor: latest_cursor.to_string(),
                 fork_steps: vec![StepNew as i32, StepUndo as i32],
                 ..Default::default()
             };
@@ -238,7 +241,8 @@ fn stream_blocks<C: Blockchain, F: FirehoseMapper<C>>(
             }
 
             let mut connect_start = Instant::now();
-            let result = endpoint.clone().stream_blocks(request).await;
+            let req = endpoint.clone().stream_blocks(request);
+            let result = tokio::time::timeout(Duration::from_secs(120), req).await.map_err(|x| x.into()).and_then(|x| x);
 
             match result {
                 Ok(stream) => {
@@ -247,13 +251,12 @@ fn stream_blocks<C: Blockchain, F: FirehoseMapper<C>>(
                     // Track the time it takes to set up the block stream
                     metrics.observe_successful_connection(&mut connect_start);
 
-                    backoff.reset();
-
                     let mut last_response_time = Instant::now();
                     let mut expected_stream_end = false;
 
                     for await response in stream {
                         match process_firehose_response(
+                            &endpoint,
                             response,
                             &mut check_subgraph_continuity,
                             manifest_start_block_num,
@@ -264,20 +267,29 @@ fn stream_blocks<C: Blockchain, F: FirehoseMapper<C>>(
                             &logger,
                         ).await {
                             Ok(BlockResponse::Proceed(event, cursor)) => {
+                                // Reset backoff because we got a good value from the stream
+                                backoff.reset();
+
                                 metrics.observe_response("proceed", &mut last_response_time);
 
                                 yield event;
 
-                                latest_cursor = cursor;
+                                latest_cursor = FirehoseCursor::from(cursor);
                             },
                             Ok(BlockResponse::Rewind(revert_to)) => {
+                                // Reset backoff because we got a good value from the stream
+                                backoff.reset();
+
                                 metrics.observe_response("rewind", &mut last_response_time);
 
                                 // It's totally correct to pass the None as the cursor here, if we are here, there
                                 // was no cursor before anyway, so it's totally fine to pass `None`
-                                yield BlockStreamEvent::Revert(revert_to.clone(), None);
+                                yield BlockStreamEvent::Revert(revert_to.clone(), FirehoseCursor::None);
 
-                                latest_cursor = "".to_string();
+                                latest_cursor = FirehoseCursor::None;
+
+                                // We have to reconnect (see below) but we don't wait to wait before doing
+                                // that, so skip the optional backing off at the end of the loop
                                 skip_backoff = true;
 
                                 // We must restart the stream to ensure we now send block from revert_to point
@@ -289,6 +301,12 @@ fn stream_blocks<C: Blockchain, F: FirehoseMapper<C>>(
                                 break;
                             },
                             Err(err) => {
+                                // We have an open connection but there was an error processing the Firehose
+                                // response. We will reconnect the stream after this; this is the case where
+                                // we actually _want_ to back off in case we keep running into the same error.
+                                // An example of this situation is if we get invalid block or transaction data
+                                // that cannot be decoded properly.
+
                                 metrics.observe_response("error", &mut last_response_time);
 
                                 error!(logger, "{:#}", err);
@@ -303,9 +321,13 @@ fn stream_blocks<C: Blockchain, F: FirehoseMapper<C>>(
                     }
                 },
                 Err(e) => {
+                    // We failed to connect and will try again; this is another
+                    // case where we actually _want_ to back off in case we keep
+                    // having connection errors.
+
                     metrics.observe_failed_connection(&mut connect_start);
 
-                    error!(logger, "Unable to connect to endpoint: {:?}", e);
+                    error!(logger, "Unable to connect to endpoint: {:#}", e);
                 }
             }
 
@@ -323,19 +345,17 @@ enum BlockResponse<C: Blockchain> {
 }
 
 async fn process_firehose_response<C: Blockchain, F: FirehoseMapper<C>>(
+    endpoint: &Arc<FirehoseEndpoint>,
     result: Result<firehose::Response, Status>,
     check_subgraph_continuity: &mut bool,
     manifest_start_block_num: BlockNumber,
     subgraph_current_block: Option<&BlockPtr>,
     mapper: &F,
-    adapter: &C::TriggersAdapter,
+    adapter: &Arc<dyn TriggersAdapter<C>>,
     filter: &C::TriggerFilter,
     logger: &Logger,
 ) -> Result<BlockResponse<C>, Error> {
-    let response = match result {
-        Ok(v) => v,
-        Err(e) => return Err(anyhow!("An error occurred while streaming blocks: {:?}", e)),
-    };
+    let response = result.context("An error occurred while streaming blocks")?;
 
     let event = mapper
         .to_block_stream_event(logger, &response, adapter, filter)
@@ -356,7 +376,7 @@ async fn process_firehose_response<C: Blockchain, F: FirehoseMapper<C>>(
                 );
 
                 let mut revert_to = mapper
-                    .final_block_ptr_for(logger, &block.block)
+                    .final_block_ptr_for(logger, endpoint, &block.block)
                     .await
                     .context("Could not fetch final block to revert to")?;
 
@@ -371,7 +391,7 @@ async fn process_firehose_response<C: Blockchain, F: FirehoseMapper<C>>(
                     }
 
                     revert_to = mapper
-                        .block_ptr_for_number(logger, block_num)
+                        .block_ptr_for_number(logger, endpoint, block_num)
                         .await
                         .context("Could not fetch manifest start block to revert to")?;
                 }
@@ -403,11 +423,11 @@ impl<C: Blockchain> BlockStream<C> for FirehoseBlockStream<C> {}
 fn must_check_subgraph_continuity(
     logger: &Logger,
     subgraph_current_block: &Option<BlockPtr>,
-    subgraph_cursor: &String,
+    subgraph_cursor: &FirehoseCursor,
     subgraph_manifest_start_block_number: i32,
 ) -> bool {
     match subgraph_current_block {
-        Some(current_block) if subgraph_cursor.is_empty() => {
+        Some(current_block) if subgraph_cursor.is_none() => {
             debug!(&logger, "Checking if subgraph current block is after manifest start block";
                 "subgraph_current_block_number" => current_block.number,
                 "manifest_start_block_number" => subgraph_manifest_start_block_number,
@@ -421,15 +441,18 @@ fn must_check_subgraph_continuity(
 
 #[cfg(test)]
 mod tests {
-    use crate::blockchain::{firehose_block_stream::must_check_subgraph_continuity, BlockPtr};
+    use crate::blockchain::{
+        block_stream::FirehoseCursor, firehose_block_stream::must_check_subgraph_continuity,
+        BlockPtr,
+    };
     use slog::{o, Logger};
 
     #[test]
     fn check_continuity() {
         let logger = Logger::root(slog::Discard, o!());
         let no_current_block: Option<BlockPtr> = None;
-        let no_cursor = "".to_string();
-        let some_cursor = "abc".to_string();
+        let no_cursor = FirehoseCursor::None;
+        let some_cursor = FirehoseCursor::from("abc".to_string());
         let some_current_block = |number: i32| -> Option<BlockPtr> {
             Some(BlockPtr {
                 hash: vec![0xab, 0xcd].into(),

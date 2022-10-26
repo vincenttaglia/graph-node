@@ -1,14 +1,13 @@
 use super::cache::{QueryBlockCache, QueryCache};
+use async_recursion::async_recursion;
 use crossbeam::atomic::AtomicCell;
 use graph::{
-    data::{schema::META_FIELD_NAME, value::Object},
+    data::{query::Trace, schema::META_FIELD_NAME, value::Object},
     prelude::{s, CheapClone},
-    util::timed_rw_lock::TimedMutex,
+    util::{lfu_cache::EvictStats, timed_rw_lock::TimedMutex},
 };
 use lazy_static::lazy_static;
-use stable_hash::crypto::SetHasher;
-use stable_hash::prelude::*;
-use stable_hash::utils::stable_hash;
+use parking_lot::MutexGuard;
 use std::time::Instant;
 use std::{borrow::ToOwned, collections::HashSet};
 
@@ -16,7 +15,7 @@ use graph::data::graphql::*;
 use graph::data::query::CacheStatus;
 use graph::env::CachedSubgraphIds;
 use graph::prelude::*;
-use graph::util::lfu_cache::LfuCache;
+use graph::util::{lfu_cache::LfuCache, stable_hash_glue::impl_stable_hash};
 
 use super::QueryHash;
 use crate::execution::ast as a;
@@ -41,10 +40,6 @@ lazy_static! {
             caches
     };
     static ref QUERY_HERD_CACHE: QueryCache<Arc<QueryResult>> = QueryCache::new("query_herd_cache");
-    static ref QUERY_LFU_CACHE: Vec<TimedMutex<LfuCache<QueryHash, WeightedResult>>> = {
-        std::iter::repeat_with(|| TimedMutex::new(LfuCache::new(), "query_lfu_cache"))
-                    .take(ENV_VARS.graphql.query_lfu_cache_shards as usize).collect()
-    };
 }
 
 struct WeightedResult {
@@ -73,33 +68,33 @@ struct HashableQuery<'a> {
     block_ptr: &'a BlockPtr,
 }
 
-/// Note that the use of StableHash here is a little bit loose. In particular,
-/// we are converting items to a string inside here as a quick-and-dirty
-/// implementation. This precludes the ability to add new fields (unlikely
-/// anyway). So, this hash isn't really Stable in the way that the StableHash
-/// crate defines it. Since hashes are only persisted for this process, we don't
-/// need that property. The reason we are using StableHash is to get collision
-/// resistance and use it's foolproof API to prevent easy mistakes instead.
-///
-/// This is also only as collision resistant insofar as the to_string impls are
-/// collision resistant. It is highly likely that this is ok, since these come
-/// from an ast.
-///
-/// It is possible that multiple asts that are effectively the same query with
-/// different representations. This is considered not an issue. The worst
-/// possible outcome is that the same query will have multiple cache entries.
-/// But, the wrong result should not be served.
-impl StableHash for HashableQuery<'_> {
-    fn stable_hash<H: StableHasher>(&self, mut sequence_number: H::Seq, state: &mut H) {
-        self.query_schema_id
-            .stable_hash(sequence_number.next_child(), state);
+// Note that the use of StableHash here is a little bit loose. In particular,
+// we are converting items to a string inside here as a quick-and-dirty
+// implementation. This precludes the ability to add new fields (unlikely
+// anyway). So, this hash isn't really Stable in the way that the StableHash
+// crate defines it. Since hashes are only persisted for this process, we don't
+// need that property. The reason we are using StableHash is to get collision
+// resistance and use it's foolproof API to prevent easy mistakes instead.
+//
+// This is also only as collision resistant insofar as the to_string impls are
+// collision resistant. It is highly likely that this is ok, since these come
+// from an ast.
+//
+// It is possible that multiple asts that are effectively the same query with
+// different representations. This is considered not an issue. The worst
+// possible outcome is that the same query will have multiple cache entries.
+// But, the wrong result should not be served.
+impl_stable_hash!(HashableQuery<'_> {
+    query_schema_id,
+    // Not stable! Uses to_string
+    // TODO: Performance: Save a cryptographic hash (Blake3) of the original query
+    // and pass it through, rather than formatting the selection set.
+    selection_set: format_selection_set,
+    block_ptr
+});
 
-        // Not stable! Uses to_string
-        format!("{:?}", self.selection_set).stable_hash(sequence_number.next_child(), state);
-
-        self.block_ptr
-            .stable_hash(sequence_number.next_child(), state);
-    }
+fn format_selection_set(s: &a::SelectionSet) -> String {
+    format!("{:?}", s)
 }
 
 // The key is: subgraph id + selection set + variables + fragment definitions
@@ -115,9 +110,75 @@ fn cache_key(
         selection_set,
         block_ptr,
     };
-    stable_hash::<SetHasher, _>(&query)
+    // Security:
+    // This uses the crypo stable hash because a collision would
+    // cause us to fetch the incorrect query response and possibly
+    // attest to it. A collision should be impossibly rare with the
+    // non-crypto version, but a determined attacker should be able
+    // to find one and cause disputes which we must avoid.
+    stable_hash::crypto_stable_hash(&query)
 }
 
+fn lfu_cache(
+    logger: &Logger,
+    cache_key: &[u8; 32],
+) -> Option<MutexGuard<'static, LfuCache<[u8; 32], WeightedResult>>> {
+    lazy_static! {
+        static ref QUERY_LFU_CACHE: Vec<TimedMutex<LfuCache<QueryHash, WeightedResult>>> = {
+            std::iter::repeat_with(|| TimedMutex::new(LfuCache::new(), "query_lfu_cache"))
+                .take(ENV_VARS.graphql.query_lfu_cache_shards as usize)
+                .collect()
+        };
+    }
+
+    match QUERY_LFU_CACHE.len() {
+        0 => None,
+        n => {
+            let shard = (cache_key[0] as usize) % n;
+            Some(QUERY_LFU_CACHE[shard].lock(logger))
+        }
+    }
+}
+
+fn log_lfu_evict_stats(
+    logger: &Logger,
+    network: &str,
+    cache_key: &[u8; 32],
+    evict_stats: Option<EvictStats>,
+) {
+    let total_shards = ENV_VARS.graphql.query_lfu_cache_shards as usize;
+
+    if total_shards > 0 {
+        if let Some(EvictStats {
+            new_weight,
+            evicted_weight,
+            new_count,
+            evicted_count,
+            stale_update,
+            evict_time,
+        }) = evict_stats
+        {
+            {
+                let shard = (cache_key[0] as usize) % total_shards;
+                let network = network.to_string();
+                let logger = logger.clone();
+
+                graph::spawn(async move {
+                    debug!(logger, "Evicted LFU cache";
+                        "shard" => shard,
+                        "network" => network,
+                        "entries" => new_count,
+                        "entries_evicted" => evicted_count,
+                        "weight" => new_weight,
+                        "weight_evicted" => evicted_weight,
+                        "stale_update" => stale_update,
+                        "evict_time_ms" => evict_time.as_millis()
+                    )
+                });
+            }
+        }
+    }
+}
 /// Contextual information passed around during query execution.
 pub struct ExecutionContext<R>
 where
@@ -179,11 +240,11 @@ where
     }
 }
 
-pub(crate) fn execute_root_selection_set_uncached(
+pub(crate) async fn execute_root_selection_set_uncached(
     ctx: &ExecutionContext<impl Resolver>,
     selection_set: &a::SelectionSet,
     root_type: &sast::ObjectType,
-) -> Result<Object, Vec<QueryExecutionError>> {
+) -> Result<(Object, Trace), Vec<QueryExecutionError>> {
     // Split the top-level fields into introspection fields and
     // regular data fields
     let mut data_set = a::SelectionSet::empty_from(selection_set);
@@ -204,27 +265,33 @@ pub(crate) fn execute_root_selection_set_uncached(
     }
 
     // If we are getting regular data, prefetch it from the database
-    let mut values = if data_set.is_empty() && meta_items.is_empty() {
-        Object::default()
+    let (mut values, trace) = if data_set.is_empty() && meta_items.is_empty() {
+        (Object::default(), Trace::None)
     } else {
-        let initial_data = ctx.resolver.prefetch(ctx, &data_set)?;
+        let (initial_data, trace) = ctx.resolver.prefetch(ctx, &data_set)?;
         data_set.push_fields(meta_items)?;
-        execute_selection_set_to_map(ctx, &data_set, root_type, initial_data)?
+        (
+            execute_selection_set_to_map(ctx, &data_set, root_type, initial_data).await?,
+            trace,
+        )
     };
 
     // Resolve introspection fields, if there are any
     if !intro_set.is_empty() {
         let ictx = ctx.as_introspection_context();
 
-        values.extend(execute_selection_set_to_map(
-            &ictx,
-            ctx.query.selection_set.as_ref(),
-            &*INTROSPECTION_QUERY_TYPE,
-            None,
-        )?);
+        values.extend(
+            execute_selection_set_to_map(
+                &ictx,
+                ctx.query.selection_set.as_ref(),
+                &*INTROSPECTION_QUERY_TYPE,
+                None,
+            )
+            .await?,
+        );
     }
 
-    Ok(values)
+    Ok((values, trace))
 }
 
 /// Executes the root selection set of a query.
@@ -266,8 +333,7 @@ pub(crate) async fn execute_root_selection_set<R: Resolver>(
                         return result;
                     }
                 }
-                {
-                    let mut cache = QUERY_LFU_CACHE[shard].lock(&ctx.logger);
+                if let Some(mut cache) = lfu_cache(&ctx.logger, &cache_key) {
                     if let Some(weighted) = cache.get(&cache_key) {
                         ctx.cache_status.store(CacheStatus::Hit);
                         return weighted.result.cheap_clone();
@@ -288,11 +354,12 @@ pub(crate) async fn execute_root_selection_set<R: Resolver>(
         let query_text = execute_ctx.query.query_text.cheap_clone();
         let variables_text = execute_ctx.query.variables_text.cheap_clone();
         match graph::spawn_blocking_allow_panic(move || {
-            let mut query_res = QueryResult::from(execute_root_selection_set_uncached(
-                &execute_ctx,
-                &execute_selection_set,
-                &execute_root_type,
-            ));
+            let mut query_res =
+                QueryResult::from(graph::block_on(execute_root_selection_set_uncached(
+                    &execute_ctx,
+                    &execute_selection_set,
+                    &execute_root_type,
+                )));
 
             // Unwrap: In practice should never fail, but if it does we will catch the panic.
             execute_ctx.resolver.post_process(&mut query_res).unwrap();
@@ -358,12 +425,16 @@ pub(crate) async fn execute_root_selection_set<R: Resolver>(
 
         if inserted {
             ctx.cache_status.store(CacheStatus::Insert);
-        } else {
+        } else if let Some(mut cache) = lfu_cache(&ctx.logger, &key) {
             // Results that are too old for the QUERY_BLOCK_CACHE go into the QUERY_LFU_CACHE
-            let mut cache = QUERY_LFU_CACHE[shard].lock(&ctx.logger);
             let max_mem = ENV_VARS.graphql.query_cache_max_mem
-                / (ENV_VARS.graphql.query_block_cache_shards as usize);
-            cache.evict_with_period(max_mem, ENV_VARS.graphql.query_cache_stale_period);
+                / ENV_VARS.graphql.query_lfu_cache_shards as usize;
+
+            let evict_stats =
+                cache.evict_with_period(max_mem, ENV_VARS.graphql.query_cache_stale_period);
+
+            log_lfu_evict_stats(&ctx.logger, network, &key, evict_stats);
+
             cache.insert(
                 key,
                 WeightedResult {
@@ -381,21 +452,18 @@ pub(crate) async fn execute_root_selection_set<R: Resolver>(
 /// Executes a selection set, requiring the result to be of the given object type.
 ///
 /// Allows passing in a parent value during recursive processing of objects and their fields.
-fn execute_selection_set<'a>(
+async fn execute_selection_set<'a>(
     ctx: &'a ExecutionContext<impl Resolver>,
     selection_set: &'a a::SelectionSet,
     object_type: &sast::ObjectType,
     prefetched_value: Option<r::Value>,
 ) -> Result<r::Value, Vec<QueryExecutionError>> {
-    Ok(r::Value::Object(execute_selection_set_to_map(
-        ctx,
-        selection_set,
-        object_type,
-        prefetched_value,
-    )?))
+    Ok(r::Value::Object(
+        execute_selection_set_to_map(ctx, selection_set, object_type, prefetched_value).await?,
+    ))
 }
 
-fn execute_selection_set_to_map<'a>(
+async fn execute_selection_set_to_map<'a>(
     ctx: &'a ExecutionContext<impl Resolver>,
     selection_set: &'a a::SelectionSet,
     object_type: &sast::ObjectType,
@@ -407,7 +475,7 @@ fn execute_selection_set_to_map<'a>(
         None => None,
     };
     let mut errors: Vec<QueryExecutionError> = Vec::new();
-    let mut result_map = Object::new();
+    let mut results = Vec::new();
 
     // Gather fields that appear more than once with the same response key.
     let multiple_response_keys = {
@@ -455,14 +523,11 @@ fn execute_selection_set_to_map<'a>(
             .flatten();
 
         if field.name.as_str() == "__typename" && field_value.is_none() {
-            result_map.insert(
-                response_key.to_owned(),
-                r::Value::String(object_type.name.clone()),
-            );
+            results.push((response_key, r::Value::String(object_type.name.clone())));
         } else {
-            match execute_field(ctx, object_type, field_value, field, field_type) {
+            match execute_field(ctx, object_type, field_value, field, field_type).await {
                 Ok(v) => {
-                    result_map.insert(response_key.to_owned(), v);
+                    results.push((response_key, v));
                 }
                 Err(mut e) => {
                     errors.append(&mut e);
@@ -472,14 +537,15 @@ fn execute_selection_set_to_map<'a>(
     }
 
     if errors.is_empty() {
-        Ok(result_map)
+        let obj = Object::from_iter(results.into_iter().map(|(k, v)| (k.to_owned(), v)));
+        Ok(obj)
     } else {
         Err(errors)
     }
 }
 
 /// Executes a field.
-fn execute_field(
+async fn execute_field(
     ctx: &ExecutionContext<impl Resolver>,
     object_type: &s::ObjectType,
     field_value: Option<r::Value>,
@@ -495,10 +561,12 @@ fn execute_field(
         &field_definition.field_type,
     )
     .and_then(|value| complete_value(ctx, field, &field_definition.field_type, value))
+    .await
 }
 
 /// Resolves the value of a field.
-fn resolve_field_value(
+#[async_recursion]
+async fn resolve_field_value(
     ctx: &ExecutionContext<impl Resolver>,
     object_type: &s::ObjectType,
     field_value: Option<r::Value>,
@@ -507,37 +575,46 @@ fn resolve_field_value(
     field_type: &s::Type,
 ) -> Result<r::Value, Vec<QueryExecutionError>> {
     match field_type {
-        s::Type::NonNullType(inner_type) => resolve_field_value(
-            ctx,
-            object_type,
-            field_value,
-            field,
-            field_definition,
-            inner_type.as_ref(),
-        ),
+        s::Type::NonNullType(inner_type) => {
+            resolve_field_value(
+                ctx,
+                object_type,
+                field_value,
+                field,
+                field_definition,
+                inner_type.as_ref(),
+            )
+            .await
+        }
 
-        s::Type::NamedType(ref name) => resolve_field_value_for_named_type(
-            ctx,
-            object_type,
-            field_value,
-            field,
-            field_definition,
-            name,
-        ),
+        s::Type::NamedType(ref name) => {
+            resolve_field_value_for_named_type(
+                ctx,
+                object_type,
+                field_value,
+                field,
+                field_definition,
+                name,
+            )
+            .await
+        }
 
-        s::Type::ListType(inner_type) => resolve_field_value_for_list_type(
-            ctx,
-            object_type,
-            field_value,
-            field,
-            field_definition,
-            inner_type.as_ref(),
-        ),
+        s::Type::ListType(inner_type) => {
+            resolve_field_value_for_list_type(
+                ctx,
+                object_type,
+                field_value,
+                field,
+                field_definition,
+                inner_type.as_ref(),
+            )
+            .await
+        }
     }
 }
 
 /// Resolves the value of a field that corresponds to a named type.
-fn resolve_field_value_for_named_type(
+async fn resolve_field_value_for_named_type(
     ctx: &ExecutionContext<impl Resolver>,
     object_type: &s::ObjectType,
     field_value: Option<r::Value>,
@@ -556,6 +633,7 @@ fn resolve_field_value_for_named_type(
         s::TypeDefinition::Object(t) => {
             ctx.resolver
                 .resolve_object(field_value, field, field_definition, t.into())
+                .await
         }
 
         // Let the resolver decide how values in the resolved object value
@@ -567,11 +645,13 @@ fn resolve_field_value_for_named_type(
         s::TypeDefinition::Scalar(t) => {
             ctx.resolver
                 .resolve_scalar_value(object_type, field, t, field_value)
+                .await
         }
 
         s::TypeDefinition::Interface(i) => {
             ctx.resolver
                 .resolve_object(field_value, field, field_definition, i.into())
+                .await
         }
 
         s::TypeDefinition::Union(_) => Err(QueryExecutionError::Unimplemented("unions".to_owned())),
@@ -582,7 +662,8 @@ fn resolve_field_value_for_named_type(
 }
 
 /// Resolves the value of a field that corresponds to a list type.
-fn resolve_field_value_for_list_type(
+#[async_recursion]
+async fn resolve_field_value_for_list_type(
     ctx: &ExecutionContext<impl Resolver>,
     object_type: &s::ObjectType,
     field_value: Option<r::Value>,
@@ -591,14 +672,17 @@ fn resolve_field_value_for_list_type(
     inner_type: &s::Type,
 ) -> Result<r::Value, Vec<QueryExecutionError>> {
     match inner_type {
-        s::Type::NonNullType(inner_type) => resolve_field_value_for_list_type(
-            ctx,
-            object_type,
-            field_value,
-            field,
-            field_definition,
-            inner_type,
-        ),
+        s::Type::NonNullType(inner_type) => {
+            resolve_field_value_for_list_type(
+                ctx,
+                object_type,
+                field_value,
+                field,
+                field_definition,
+                inner_type,
+            )
+            .await
+        }
 
         s::Type::NamedType(ref type_name) => {
             let named_type = ctx
@@ -613,6 +697,7 @@ fn resolve_field_value_for_list_type(
                 s::TypeDefinition::Object(t) => ctx
                     .resolver
                     .resolve_objects(field_value, field, field_definition, t.into())
+                    .await
                     .map_err(|e| vec![e]),
 
                 // Let the resolver decide how values in the resolved object value
@@ -630,6 +715,7 @@ fn resolve_field_value_for_list_type(
                 s::TypeDefinition::Interface(t) => ctx
                     .resolver
                     .resolve_objects(field_value, field, field_definition, t.into())
+                    .await
                     .map_err(|e| vec![e]),
 
                 s::TypeDefinition::Union(_) => Err(vec![QueryExecutionError::Unimplemented(
@@ -650,7 +736,8 @@ fn resolve_field_value_for_list_type(
 }
 
 /// Ensures that a value matches the expected return type.
-fn complete_value(
+#[async_recursion]
+async fn complete_value(
     ctx: &ExecutionContext<impl Resolver>,
     field: &a::Field,
     field_type: &s::Type,
@@ -659,7 +746,7 @@ fn complete_value(
     match field_type {
         // Fail if the field type is non-null but the value is null
         s::Type::NonNullType(inner_type) => {
-            match complete_value(ctx, field, inner_type, resolved_value)? {
+            match complete_value(ctx, field, inner_type, resolved_value).await? {
                 r::Value::Null => Err(vec![QueryExecutionError::NonNullError(
                     field.position,
                     field.name.to_string(),
@@ -683,7 +770,7 @@ fn complete_value(
                     for value_place in &mut values {
                         // Put in a placeholder, complete the value, put the completed value back.
                         let value = std::mem::replace(value_place, r::Value::Null);
-                        match complete_value(ctx, field, inner_type, value) {
+                        match complete_value(ctx, field, inner_type, value).await {
                             Ok(value) => {
                                 *value_place = value;
                             }
@@ -746,6 +833,7 @@ fn complete_value(
                         &object_type,
                         Some(resolved_value),
                     )
+                    .await
                 }
 
                 // Resolve interface types using the resolved value and complete the value recursively
@@ -758,6 +846,7 @@ fn complete_value(
                         &object_type,
                         Some(resolved_value),
                     )
+                    .await
                 }
 
                 // Resolve union types using the resolved value and complete the value recursively
@@ -770,6 +859,7 @@ fn complete_value(
                         &object_type,
                         Some(resolved_value),
                     )
+                    .await
                 }
 
                 s::TypeDefinition::InputObject(_) => {

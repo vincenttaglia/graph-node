@@ -8,7 +8,9 @@ pub mod gas;
 mod asc_heap;
 mod asc_ptr;
 
-pub use asc_heap::{asc_get, asc_new, try_asc_get, AscHeap, FromAscObj, ToAscObj, TryFromAscObj};
+pub use asc_heap::{
+    asc_get, asc_new, asc_new_or_missing, asc_new_or_null, AscHeap, FromAscObj, ToAscObj,
+};
 pub use asc_ptr::AscPtr;
 
 use anyhow::Error;
@@ -265,62 +267,94 @@ pub enum IndexForAscTypeId {
     // ...
     // LastEthereumType = 1499,
 
-    // Reserved discriminant space for Tendermint type IDs: [1,500, 2,499]
-    TendermintArrayBytes = 1500,
-    TendermintArrayCommitSig = 1501,
-    TendermintArrayEvent = 1502,
-    TendermintArrayEventAttribute = 1503,
-    TendermintArrayEventTx = 1504,
-    TendermintArrayEvidence = 1505,
-    TendermintArrayValidator = 1506,
-    TendermintArrayValidatorUpdate = 1507,
-    TendermintBlock = 1508,
-    TendermintBlockID = 1509,
-    TendermintBlockIDFlagEnum = 1510,
-    TendermintBlockParams = 1511,
-    TendermintCommit = 1512,
-    TendermintCommitSig = 1513,
-    TendermintConsensus = 1514,
-    TendermintConsensusParams = 1515,
-    TendermintData = 1516,
-    TendermintDuplicateVoteEvidence = 1517,
-    TendermintDuration = 1518,
-    TendermintEvent = 1519,
-    TendermintEventAttribute = 1520,
-    TendermintEventBlock = 1521,
-    TendermintEventData = 1522,
-    TendermintEventList = 1523,
-    TendermintEventTx = 1524,
-    TendermintEventValidatorSetUpdates = 1525,
-    TendermintEventVote = 1526,
-    TendermintEvidence = 1527,
-    TendermintEvidenceList = 1528,
-    TendermintEvidenceParams = 1529,
-    TendermintHeader = 1530,
-    TendermintLightBlock = 1531,
-    TendermintLightClientAttackEvidence = 1532,
-    TendermintPartSetHeader = 1533,
-    TendermintPublicKey = 1534,
-    TendermintResponseBeginBlock = 1535,
-    TendermintResponseDeliverTx = 1536,
-    TendermintResponseEndBlock = 1537,
-    TendermintSignedHeader = 1538,
-    TendermintSignedMsgTypeEnum = 1539,
-    TendermintTimestamp = 1540,
-    TendermintTxResult = 1541,
-    TendermintValidator = 1542,
-    TendermintValidatorParams = 1543,
-    TendermintValidatorSet = 1544,
-    TendermintValidatorUpdate = 1545,
-    TendermintVersionParams = 1546,
-    // Continue to add more Tendermint type IDs here.
+    // Reserved discriminant space for Cosmos type IDs: [1,500, 2,499]
+    CosmosAny = 1500,
+    CosmosAnyArray = 1501,
+    CosmosBytesArray = 1502,
+    CosmosCoinArray = 1503,
+    CosmosCommitSigArray = 1504,
+    CosmosEventArray = 1505,
+    CosmosEventAttributeArray = 1506,
+    CosmosEvidenceArray = 1507,
+    CosmosModeInfoArray = 1508,
+    CosmosSignerInfoArray = 1509,
+    CosmosTxResultArray = 1510,
+    CosmosValidatorArray = 1511,
+    CosmosValidatorUpdateArray = 1512,
+    CosmosAuthInfo = 1513,
+    CosmosBlock = 1514,
+    CosmosBlockId = 1515,
+    CosmosBlockIdFlagEnum = 1516,
+    CosmosBlockParams = 1517,
+    CosmosCoin = 1518,
+    CosmosCommit = 1519,
+    CosmosCommitSig = 1520,
+    CosmosCompactBitArray = 1521,
+    CosmosConsensus = 1522,
+    CosmosConsensusParams = 1523,
+    CosmosDuplicateVoteEvidence = 1524,
+    CosmosDuration = 1525,
+    CosmosEvent = 1526,
+    CosmosEventAttribute = 1527,
+    CosmosEventData = 1528,
+    CosmosEventVote = 1529,
+    CosmosEvidence = 1530,
+    CosmosEvidenceList = 1531,
+    CosmosEvidenceParams = 1532,
+    CosmosFee = 1533,
+    CosmosHeader = 1534,
+    CosmosHeaderOnlyBlock = 1535,
+    CosmosLightBlock = 1536,
+    CosmosLightClientAttackEvidence = 1537,
+    CosmosModeInfo = 1538,
+    CosmosModeInfoMulti = 1539,
+    CosmosModeInfoSingle = 1540,
+    CosmosPartSetHeader = 1541,
+    CosmosPublicKey = 1542,
+    CosmosResponseBeginBlock = 1543,
+    CosmosResponseDeliverTx = 1544,
+    CosmosResponseEndBlock = 1545,
+    CosmosSignModeEnum = 1546,
+    CosmosSignedHeader = 1547,
+    CosmosSignedMsgTypeEnum = 1548,
+    CosmosSignerInfo = 1549,
+    CosmosTimestamp = 1550,
+    CosmosTip = 1551,
+    CosmosTransactionData = 1552,
+    CosmosTx = 1553,
+    CosmosTxBody = 1554,
+    CosmosTxResult = 1555,
+    CosmosValidator = 1556,
+    CosmosValidatorParams = 1557,
+    CosmosValidatorSet = 1558,
+    CosmosValidatorSetUpdates = 1559,
+    CosmosValidatorUpdate = 1560,
+    CosmosVersionParams = 1561,
+    CosmosMessageData = 1562,
+    CosmosTransactionContext = 1563,
+    // Continue to add more Cosmos type IDs here.
     // e.g.:
-    // NextTendermintType = 1547,
-    // AnotherTendermintType = 1547,
+    // NextCosmosType = 1564,
+    // AnotherCosmosType = 1565,
     // ...
-    // LastTendermintType = 2499,
+    // LastCosmosType = 2499,
 
-    // Reserved discriminant space for a future blockchain type IDs: [2,500, 3,499]
+    // Arweave types
+    ArweaveBlock = 2500,
+    ArweaveProofOfAccess = 2501,
+    ArweaveTag = 2502,
+    ArweaveTagArray = 2503,
+    ArweaveTransaction = 2504,
+    ArweaveTransactionArray = 2505,
+    ArweaveTransactionWithBlockPtr = 2506,
+    // Continue to add more Arweave type IDs here.
+    // e.g.:
+    // NextArweaveType = 2507,
+    // AnotherArweaveType = 2508,
+    // ...
+    // LastArweaveType = 3499,
+
+    // Reserved discriminant space for a future blockchain type IDs: [3,500, 4,499]
     //
     // Generated with the following shell script:
     //
@@ -331,8 +365,19 @@ pub enum IndexForAscTypeId {
     // INSTRUCTIONS:
     // 1. Replace the IDENTIFIER_PREFIX and the SRC_FILE placeholders according to the blockchain
     //    name and implementation before running this script.
-    // 2. Replace `2500` part with the first number of that blockchain's reserved discriminant space.
+    // 2. Replace `3500` part with the first number of that blockchain's reserved discriminant space.
     // 3. Insert the output right before the end of this block.
+    UnitTestNetworkUnitTestTypeU32 = u32::MAX - 7,
+    UnitTestNetworkUnitTestTypeU32Array = u32::MAX - 6,
+
+    UnitTestNetworkUnitTestTypeU16 = u32::MAX - 5,
+    UnitTestNetworkUnitTestTypeU16Array = u32::MAX - 4,
+
+    UnitTestNetworkUnitTestTypeI8 = u32::MAX - 3,
+    UnitTestNetworkUnitTestTypeI8Array = u32::MAX - 2,
+
+    UnitTestNetworkUnitTestTypeBool = u32::MAX - 1,
+    UnitTestNetworkUnitTestTypeBoolArray = u32::MAX,
 }
 
 impl ToAscObj<u32> for IndexForAscTypeId {
@@ -382,19 +427,13 @@ impl std::error::Error for DeterministicHostError {}
 #[derive(thiserror::Error, Debug)]
 pub enum HostExportError {
     #[error("{0:#}")]
-    Unknown(anyhow::Error),
+    Unknown(#[from] anyhow::Error),
 
     #[error("{0:#}")]
     PossibleReorg(anyhow::Error),
 
     #[error("{0:#}")]
     Deterministic(anyhow::Error),
-}
-
-impl From<anyhow::Error> for HostExportError {
-    fn from(e: anyhow::Error) -> Self {
-        HostExportError::Unknown(e)
-    }
 }
 
 impl From<DeterministicHostError> for HostExportError {

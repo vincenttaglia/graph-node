@@ -16,8 +16,6 @@ use super::{Block, BlockPtr, Blockchain};
 use crate::components::store::BlockNumber;
 use crate::data::subgraph::UnifiedMappingApiVersion;
 use crate::prelude::*;
-#[cfg(debug_assertions)]
-use fail::fail_point;
 
 // A high number here forces a slow start.
 const STARTING_PREVIOUS_TRIGGERS_PER_BLOCK: f64 = 1_000_000.0;
@@ -81,7 +79,7 @@ where
     C: Blockchain,
 {
     chain_store: Arc<dyn ChainStore>,
-    adapter: Arc<C::TriggersAdapter>,
+    adapter: Arc<dyn TriggersAdapter<C>>,
     node_id: NodeId,
     subgraph_id: DeploymentHash,
     // This is not really a block number, but the (unsigned) difference
@@ -148,7 +146,7 @@ where
     pub fn new(
         chain_store: Arc<dyn ChainStore>,
         chain_head_update_stream: ChainHeadUpdateStream,
-        adapter: Arc<C::TriggersAdapter>,
+        adapter: Arc<dyn TriggersAdapter<C>>,
         node_id: NodeId,
         subgraph_id: DeploymentHash,
         filter: Arc<C::TriggerFilter>,
@@ -308,7 +306,7 @@ where
                 // Note: We can safely unwrap the subgraph ptr here, because
                 // if it was `None`, `is_on_main_chain` would be true.
                 let from = subgraph_ptr.unwrap();
-                let parent = self.parent_ptr(&from).await?;
+                let parent = self.parent_ptr(&from, "is_on_main_chain").await?;
 
                 return Ok(ReconciliationStep::Revert(parent));
             }
@@ -411,12 +409,6 @@ where
             let subgraph_ptr =
                 subgraph_ptr.expect("subgraph block pointer should not be `None` here");
 
-            #[cfg(debug_assertions)]
-            if test_reorg(subgraph_ptr.clone()) {
-                let parent = self.parent_ptr(&subgraph_ptr).await?;
-                return Ok(ReconciliationStep::Revert(parent));
-            }
-
             // Precondition: subgraph_ptr.number < head_ptr.number
             // Walk back to one block short of subgraph_ptr.number
             let offset = head_ptr.number - subgraph_ptr.number - 1;
@@ -449,7 +441,7 @@ where
                             .await?;
                         Ok(ReconciliationStep::ProcessDescendantBlocks(vec![block], 1))
                     } else {
-                        let parent = self.parent_ptr(&subgraph_ptr).await?;
+                        let parent = self.parent_ptr(&subgraph_ptr, "nonfinal").await?;
 
                         // The subgraph ptr is not on the main chain.
                         // We will need to step back (possibly repeatedly) one block at a time
@@ -461,12 +453,11 @@ where
         }
     }
 
-    async fn parent_ptr(&self, block_ptr: &BlockPtr) -> Result<BlockPtr, Error> {
-        let ptr = self
-            .adapter
-            .parent_ptr(block_ptr)
-            .await?
-            .expect("genesis block can't be reverted");
+    async fn parent_ptr(&self, block_ptr: &BlockPtr, reason: &str) -> Result<BlockPtr, Error> {
+        let ptr =
+            self.adapter.parent_ptr(block_ptr).await?.ok_or_else(|| {
+                anyhow!("Failed to get parent pointer for {block_ptr} ({reason})")
+            })?;
 
         Ok(ptr)
     }
@@ -617,28 +608,4 @@ impl<C: Blockchain> Stream for PollingBlockStream<C> {
 
         result
     }
-}
-
-// This always returns `false` in a normal build. A test may configure reorg by enabling
-// "test_reorg" fail point with the number of the block that should be reorged.
-#[cfg(debug_assertions)]
-#[allow(unused_variables)]
-fn test_reorg(ptr: BlockPtr) -> bool {
-    fail_point!("test_reorg", |reorg_at| {
-        use std::str::FromStr;
-
-        static REORGED: std::sync::Once = std::sync::Once::new();
-
-        if REORGED.is_completed() {
-            return false;
-        }
-        let reorg_at = BlockNumber::from_str(&reorg_at.unwrap()).unwrap();
-        let should_reorg = ptr.number == reorg_at;
-        if should_reorg {
-            REORGED.call_once(|| {})
-        }
-        should_reorg
-    });
-
-    false
 }

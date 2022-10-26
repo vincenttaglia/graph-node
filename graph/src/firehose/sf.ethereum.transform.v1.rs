@@ -1,7 +1,36 @@
+/// CombinedFilter is a combination of "LogFilters" and "CallToFilters"
+///
+/// It transforms the requested stream in two ways: 
+///   1. STRIPPING
+///      The block data is stripped from all transactions that don't
+///      match any of the filters.  
+///
+///   2. SKIPPING
+///      If an "block index" covers a range containing a
+///      block that does NOT match any of the filters, the block will be
+///      skipped altogether, UNLESS send_all_block_headers is enabled
+///      In that case, the block would still be sent, but without any
+///      transactionTrace
+///
+/// The SKIPPING feature only applies to historical blocks, because
+/// the "block index" is always produced after the merged-blocks files
+/// are produced. Therefore, the "live" blocks are never filtered out.
+///
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct CombinedFilter {
+    #[prost(message, repeated, tag="1")]
+    pub log_filters: ::prost::alloc::vec::Vec<LogFilter>,
+    #[prost(message, repeated, tag="2")]
+    pub call_filters: ::prost::alloc::vec::Vec<CallToFilter>,
+    /// Always send all blocks. if they don't match any log_filters or call_filters, 
+    /// all the transactions will be filtered out, sending only the header.
+    #[prost(bool, tag="3")]
+    pub send_all_block_headers: bool,
+}
 /// MultiLogFilter concatenates the results of each LogFilter (inclusive OR)
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct MultiLogFilter {
-    #[prost(message, repeated, tag = "1")]
+    #[prost(message, repeated, tag="1")]
     pub log_filters: ::prost::alloc::vec::Vec<LogFilter>,
 }
 /// LogFilter will match calls where *BOTH*
@@ -11,16 +40,16 @@ pub struct MultiLogFilter {
 /// a LogFilter with both empty addresses and event_signatures lists is invalid and will fail.
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct LogFilter {
-    #[prost(bytes = "vec", repeated, tag = "1")]
+    #[prost(bytes="vec", repeated, tag="1")]
     pub addresses: ::prost::alloc::vec::Vec<::prost::alloc::vec::Vec<u8>>,
     /// corresponds to the keccak of the event signature which is stores in topic.0
-    #[prost(bytes = "vec", repeated, tag = "2")]
+    #[prost(bytes="vec", repeated, tag="2")]
     pub event_signatures: ::prost::alloc::vec::Vec<::prost::alloc::vec::Vec<u8>>,
 }
 /// MultiCallToFilter concatenates the results of each CallToFilter (inclusive OR)
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct MultiCallToFilter {
-    #[prost(message, repeated, tag = "1")]
+    #[prost(message, repeated, tag="1")]
     pub call_filters: ::prost::alloc::vec::Vec<CallToFilter>,
 }
 /// CallToFilter will match calls where *BOTH*
@@ -30,10 +59,11 @@ pub struct MultiCallToFilter {
 /// a CallToFilter with both empty addresses and signatures lists is invalid and will fail.
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct CallToFilter {
-    #[prost(bytes = "vec", repeated, tag = "1")]
+    #[prost(bytes="vec", repeated, tag="1")]
     pub addresses: ::prost::alloc::vec::Vec<::prost::alloc::vec::Vec<u8>>,
-    #[prost(bytes = "vec", repeated, tag = "2")]
+    #[prost(bytes="vec", repeated, tag="2")]
     pub signatures: ::prost::alloc::vec::Vec<::prost::alloc::vec::Vec<u8>>,
 }
 #[derive(Clone, PartialEq, ::prost::Message)]
-pub struct LightBlock {}
+pub struct LightBlock {
+}

@@ -3,8 +3,6 @@ use semver::Version;
 use std::collections::BTreeSet;
 use thiserror::Error;
 
-use super::SubgraphManifestValidationError;
-
 pub const API_VERSION_0_0_2: Version = Version::new(0, 0, 2);
 
 /// This version adds a new subgraph validation step that rejects manifests whose mappings have
@@ -27,6 +25,12 @@ pub const SPEC_VERSION_0_0_4: Version = Version::new(0, 0, 4);
 
 /// This version supports event handlers having access to transaction receipts.
 pub const SPEC_VERSION_0_0_5: Version = Version::new(0, 0, 5);
+
+/// Enables the Fast POI calculation variant.
+pub const SPEC_VERSION_0_0_6: Version = Version::new(0, 0, 6);
+
+/// Enables offchain data sources.
+pub const SPEC_VERSION_0_0_7: Version = Version::new(0, 0, 7);
 
 pub const MIN_SPEC_VERSION: Version = Version::new(0, 0, 2);
 
@@ -69,13 +73,7 @@ pub(super) fn format_versions(versions: &BTreeSet<Version>) -> String {
 
 #[derive(Error, Debug, PartialEq)]
 #[error("Expected a single apiVersion for mappings. Found: {}.", format_versions(.0))]
-pub struct DifferentMappingApiVersions(BTreeSet<Version>);
-
-impl From<DifferentMappingApiVersions> for SubgraphManifestValidationError {
-    fn from(versions: DifferentMappingApiVersions) -> Self {
-        SubgraphManifestValidationError::DifferentApiVersions(versions.0)
-    }
-}
+pub struct DifferentMappingApiVersions(pub BTreeSet<Version>);
 
 #[test]
 fn unified_mapping_api_version_from_iterator() {

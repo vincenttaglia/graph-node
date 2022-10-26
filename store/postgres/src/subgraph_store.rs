@@ -15,7 +15,10 @@ use graph::{
     cheap_clone::CheapClone,
     components::{
         server::index_node::VersionInfo,
-        store::{self, BlockStore, DeploymentLocator, EnsLookup as EnsLookupTrait, SubgraphFork},
+        store::{
+            self, BlockStore, DeploymentLocator, DeploymentSchemaVersion,
+            EnsLookup as EnsLookupTrait, PruneReporter, SubgraphFork,
+        },
     },
     constraint_violation,
     data::query::QueryTarget,
@@ -23,9 +26,10 @@ use graph::{
     prelude::StoreEvent,
     prelude::{
         anyhow, futures03::future::join_all, lazy_static, o, web3::types::Address, ApiSchema,
-        BlockHash, BlockNumber, BlockPtr, ChainStore, DeploymentHash, EntityOperation, Logger,
-        MetricsRegistry, NodeId, PartialBlockPtr, Schema, StoreError, SubgraphName,
-        SubgraphStore as SubgraphStoreTrait, SubgraphVersionSwitchingMode,
+        ApiVersion, BlockHash, BlockNumber, BlockPtr, ChainStore, DeploymentHash, EntityOperation,
+        Logger, MetricsRegistry, NodeId, PartialBlockPtr, Schema, StoreError,
+        SubgraphDeploymentEntity, SubgraphName, SubgraphStore as SubgraphStoreTrait,
+        SubgraphVersionSwitchingMode,
     },
     url::Url,
     util::timed_cache::TimedCache,
@@ -34,6 +38,7 @@ use graph::{
 use crate::fork;
 use crate::{
     connection_pool::ConnectionPool,
+    deployment::SubgraphHealth,
     primary,
     primary::{DeploymentId, Mirror as PrimaryMirror, Site},
     relational::Layout,
@@ -224,7 +229,7 @@ impl SubgraphStore {
         }
     }
 
-    pub(crate) async fn get_proof_of_indexing(
+    pub async fn get_proof_of_indexing(
         &self,
         id: &DeploymentHash,
         indexer: &Option<Address>,
@@ -368,6 +373,20 @@ impl SubgraphStoreInner {
         Ok(site)
     }
 
+    fn evict(&self, id: &DeploymentHash) -> Result<(), StoreError> {
+        if let Some((site, _)) = self.sites.remove(id) {
+            let store = self.stores.get(&site.shard).ok_or_else(|| {
+                constraint_violation!(
+                    "shard {} for deployment sgd{} not found when evicting",
+                    site.shard,
+                    site.id
+                )
+            })?;
+            store.layout_cache.remove(&site);
+        }
+        Ok(())
+    }
+
     fn find_site(&self, id: DeploymentId) -> Result<Arc<Site>, StoreError> {
         if let Some(site) = self.sites.find(|site| site.id == id) {
             return Ok(site);
@@ -494,6 +513,14 @@ impl SubgraphStoreInner {
         #[cfg(not(debug_assertions))]
         assert!(!replace);
 
+        self.evict(&schema.id)?;
+
+        let graft_base = deployment
+            .graft_base
+            .as_ref()
+            .map(|base| self.layout(base))
+            .transpose()?;
+
         let (site, node_id) = {
             // We need to deal with two situations:
             //   (1) We are really creating a new subgraph; it therefore needs
@@ -506,18 +533,16 @@ impl SubgraphStoreInner {
             //       assignment that we used last time to avoid creating
             //       the same deployment in another shard
             let (shard, node_id) = self.place(&name, &network_name, node_id)?;
+            let schema_version = match &graft_base {
+                None => DeploymentSchemaVersion::LATEST,
+                Some(src_layout) => src_layout.site.schema_version,
+            };
             let conn = self.primary_conn()?;
-            let site = conn.allocate_site(shard, &schema.id, network_name)?;
+            let site = conn.allocate_site(shard, &schema.id, network_name, schema_version)?;
             let node_id = conn.assigned_node(&site)?.unwrap_or(node_id);
             (site, node_id)
         };
         let site = Arc::new(site);
-
-        let graft_base = deployment
-            .graft_base
-            .as_ref()
-            .map(|base| self.layout(base))
-            .transpose()?;
 
         if let Some(graft_base) = &graft_base {
             self.primary_conn()?
@@ -684,8 +709,8 @@ impl SubgraphStoreInner {
         for_subscription: bool,
     ) -> Result<(Arc<DeploymentStore>, Arc<Site>, ReplicaId), StoreError> {
         let id = match target {
-            QueryTarget::Name(name) => self.mirror.current_deployment_for_subgraph(&name)?,
-            QueryTarget::Deployment(id) => id,
+            QueryTarget::Name(name, _) => self.mirror.current_deployment_for_subgraph(&name)?,
+            QueryTarget::Deployment(id, _) => id,
         };
 
         let (store, site) = self.store(&id)?;
@@ -997,13 +1022,13 @@ impl SubgraphStoreInner {
         .await;
     }
 
-    pub async fn analyze(
+    pub fn analyze(
         &self,
         deployment: &DeploymentLocator,
         entity_name: &str,
     ) -> Result<(), StoreError> {
         let (store, site) = self.store(&deployment.hash)?;
-        store.analyze(site, entity_name).await
+        store.analyze(site, entity_name)
     }
 
     pub async fn create_manual_index(
@@ -1035,6 +1060,59 @@ impl SubgraphStoreInner {
     ) -> Result<(), StoreError> {
         let (store, site) = self.store(&deployment.hash)?;
         store.drop_index(site, index_name).await
+    }
+
+    pub async fn set_account_like(
+        &self,
+        deployment: &DeploymentLocator,
+        table: &str,
+        is_account_like: bool,
+    ) -> Result<(), StoreError> {
+        let (store, site) = self.store(&deployment.hash)?;
+        store.set_account_like(site, table, is_account_like).await
+    }
+
+    /// Remove the history that is only needed to respond to queries before
+    /// block number `earliest_block` from the given deployment
+    ///
+    /// Only tables with a ratio of entities to entity versions below
+    /// `prune_ratio` will be pruned; that ratio is determined by looking at
+    /// Postgres planner stats to avoid lengthy counting queries. It is
+    /// assumed that if the ratio is higher than `prune_ratio` that pruning
+    /// won't make much of a difference and will just cause unnecessary
+    /// work.
+    ///
+    /// The `reorg_threshold` is used to determine which blocks will not be
+    /// modified any more by the subgraph writer that may be running
+    /// concurrently to reduce the amount of time that the writer needs to
+    /// be locked out while pruning is happening.
+    ///
+    /// Pruning can take a long time, and is structured into multiple
+    /// transactions such that none of them takes an excessively long time.
+    /// If pruning gets interrupted, it may leave some intermediate tables
+    /// in the database behind. Those will get cleaned up the next time an
+    /// attempt is made to prune the same deployment.
+    pub async fn prune(
+        &self,
+        reporter: Box<dyn PruneReporter>,
+        deployment: &DeploymentLocator,
+        earliest_block: BlockNumber,
+        reorg_threshold: BlockNumber,
+        prune_ratio: f64,
+    ) -> Result<Box<dyn PruneReporter>, StoreError> {
+        // Find the store by the deployment id; otherwise, we could only
+        // prune the active copy of the deployment with `deployment.hash`
+        let site = self.find_site(deployment.id.into())?;
+        let store = self.for_site(&site)?;
+
+        store
+            .prune(reporter, site, earliest_block, reorg_threshold, prune_ratio)
+            .await
+    }
+
+    pub fn load_deployment(&self, site: &Site) -> Result<SubgraphDeploymentEntity, StoreError> {
+        let src_store = self.for_site(site)?;
+        src_store.load_deployment(site)
     }
 }
 
@@ -1135,10 +1213,14 @@ impl SubgraphStoreTrait for SubgraphStore {
         Ok(info.input)
     }
 
-    fn api_schema(&self, id: &DeploymentHash) -> Result<Arc<ApiSchema>, StoreError> {
+    fn api_schema(
+        &self,
+        id: &DeploymentHash,
+        version: &ApiVersion,
+    ) -> Result<Arc<ApiSchema>, StoreError> {
         let (store, site) = self.store(id)?;
         let info = store.subgraph_info(&site)?;
-        Ok(info.api)
+        Ok(info.api.get(version).unwrap().clone())
     }
 
     fn debug_fork(
@@ -1172,7 +1254,12 @@ impl SubgraphStoreTrait for SubgraphStore {
         // idempotent and there is ever only one `WritableStore` for any
         // deployment
         if let Some(writable) = self.writables.lock().unwrap().get(&deployment) {
-            return Ok(writable.cheap_clone());
+            // A poisoned writable will not write anything anymore; we
+            // discard it and create a new one that is properly initialized
+            // according to the state in the database.
+            if !writable.poisoned() {
+                return Ok(writable.cheap_clone());
+            }
         }
 
         // Ideally the lower level functions would be asyncified.
@@ -1193,6 +1280,18 @@ impl SubgraphStoreTrait for SubgraphStore {
         Ok(writable)
     }
 
+    async fn stop_subgraph(&self, loc: &DeploymentLocator) -> Result<(), StoreError> {
+        self.evict(&loc.hash)?;
+
+        // Remove the writable from the cache and stop it
+        let deployment = loc.id.into();
+        let writable = self.writables.lock().unwrap().remove(&deployment);
+        match writable {
+            Some(writable) => writable.stop().await,
+            None => Ok(()),
+        }
+    }
+
     fn is_deployed(&self, id: &DeploymentHash) -> Result<bool, StoreError> {
         match self.site(id) {
             Ok(_) => Ok(true),
@@ -1206,6 +1305,12 @@ impl SubgraphStoreTrait for SubgraphStore {
         store.block_ptr(site.cheap_clone()).await
     }
 
+    async fn is_healthy(&self, id: &DeploymentHash) -> Result<bool, StoreError> {
+        let (store, site) = self.store(id)?;
+        let health = store.health(&site).await?;
+        Ok(matches!(health, SubgraphHealth::Healthy))
+    }
+
     /// Find the deployment locators for the subgraph with the given hash
     fn locators(&self, hash: &str) -> Result<Vec<DeploymentLocator>, StoreError> {
         Ok(self
@@ -1214,5 +1319,14 @@ impl SubgraphStoreTrait for SubgraphStore {
             .iter()
             .map(|site| site.into())
             .collect())
+    }
+
+    async fn set_manifest_raw_yaml(
+        &self,
+        hash: &DeploymentHash,
+        raw_yaml: String,
+    ) -> Result<(), StoreError> {
+        let (store, site) = self.store(hash)?;
+        store.set_manifest_raw_yaml(site, raw_yaml).await
     }
 }

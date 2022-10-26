@@ -3,10 +3,14 @@ use std::sync::Mutex;
 use std::time::Duration;
 use std::{collections::BTreeMap, sync::Arc};
 
+use graph::blockchain::block_stream::FirehoseCursor;
+use graph::components::store::EntityKey;
+use graph::components::store::ReadStore;
 use graph::data::subgraph::schema;
 use graph::env::env_var;
 use graph::prelude::{
-    BlockNumber, Entity, MetricsRegistry, Schema, SubgraphStore as _, BLOCK_NUMBER_MAX,
+    BlockNumber, Entity, MetricsRegistry, Schema, SubgraphDeploymentEntity, SubgraphStore as _,
+    BLOCK_NUMBER_MAX,
 };
 use graph::slog::info;
 use graph::util::bounded_queue::BoundedQueue;
@@ -15,8 +19,8 @@ use graph::{
     components::store::{self, EntityType, WritableStore as WritableStoreTrait},
     data::subgraph::schema::SubgraphError,
     prelude::{
-        BlockPtr, DeploymentHash, EntityKey, EntityModification, Error, Logger, StopwatchMetrics,
-        StoreError, StoreEvent, UnfailOutcome, ENV_VARS,
+        BlockPtr, DeploymentHash, EntityModification, Error, Logger, StopwatchMetrics, StoreError,
+        StoreEvent, UnfailOutcome, ENV_VARS,
     },
     slog::{error, warn},
     util::backoff::ExponentialBackoff,
@@ -54,6 +58,10 @@ impl WritableSubgraphStore {
 
     fn layout(&self, id: &DeploymentHash) -> Result<Arc<Layout>, StoreError> {
         self.0.layout(id)
+    }
+
+    fn load_deployment(&self, site: &Site) -> Result<SubgraphDeploymentEntity, StoreError> {
+        self.0.load_deployment(site)
     }
 }
 
@@ -156,28 +164,25 @@ impl SyncStore {
         .await
     }
 
-    async fn block_cursor(&self) -> Result<Option<String>, StoreError> {
-        self.writable.block_cursor(self.site.cheap_clone()).await
-    }
-
-    async fn delete_block_cursor(&self) -> Result<(), StoreError> {
+    async fn block_cursor(&self) -> Result<FirehoseCursor, StoreError> {
         self.writable
-            .delete_block_cursor(self.site.cheap_clone())
+            .block_cursor(self.site.cheap_clone())
             .await
+            .map(FirehoseCursor::from)
     }
 
     fn start_subgraph_deployment(&self, logger: &Logger) -> Result<(), StoreError> {
         self.retry("start_subgraph_deployment", || {
-            let store = &self.writable;
-
-            let graft_base = match store.graft_pending(&self.site.deployment)? {
+            let graft_base = match self.writable.graft_pending(&self.site.deployment)? {
                 Some((base_id, base_ptr)) => {
                     let src = self.store.layout(&base_id)?;
-                    Some((src, base_ptr))
+                    let deployment_entity = self.store.load_deployment(&src.site)?;
+                    Some((src, base_ptr, deployment_entity))
                 }
                 None => None,
             };
-            store.start_subgraph(logger, self.site.clone(), graft_base)?;
+            self.writable
+                .start_subgraph(logger, self.site.clone(), graft_base)?;
             self.store.primary_conn()?.copy_finished(self.site.as_ref())
         })
     }
@@ -185,7 +190,7 @@ impl SyncStore {
     fn revert_block_operations(
         &self,
         block_ptr_to: BlockPtr,
-        firehose_cursor: Option<&str>,
+        firehose_cursor: &FirehoseCursor,
     ) -> Result<(), StoreError> {
         self.retry("revert_block_operations", || {
             let event = self.writable.revert_block_operations(
@@ -250,20 +255,14 @@ impl SyncStore {
     fn transact_block_operations(
         &self,
         block_ptr_to: &BlockPtr,
-        firehose_cursor: Option<&str>,
+        firehose_cursor: &FirehoseCursor,
         mods: &[EntityModification],
         stopwatch: &StopwatchMetrics,
         data_sources: &[StoredDynamicDataSource],
         deterministic_errors: &[SubgraphError],
+        manifest_idx_and_name: &[(u32, String)],
+        processed_data_sources: &[StoredDynamicDataSource],
     ) -> Result<(), StoreError> {
-        fn same_subgraph(mods: &[EntityModification], id: &DeploymentHash) -> bool {
-            mods.iter().all(|md| &md.entity_key().subgraph_id == id)
-        }
-
-        assert!(
-            same_subgraph(mods, &self.site.deployment),
-            "can only transact operations within one shard"
-        );
         self.retry("transact_block_operations", move || {
             let event = self.writable.transact_block_operations(
                 self.site.clone(),
@@ -273,6 +272,8 @@ impl SyncStore {
                 stopwatch,
                 data_sources,
                 deterministic_errors,
+                manifest_idx_and_name,
+                processed_data_sources,
             )?;
 
             let _section = stopwatch.start_section("send_store_event");
@@ -314,10 +315,15 @@ impl SyncStore {
     async fn load_dynamic_data_sources(
         &self,
         block: BlockNumber,
+        manifest_idx_and_name: Vec<(u32, String)>,
     ) -> Result<Vec<StoredDynamicDataSource>, StoreError> {
         self.retry_async("load_dynamic_data_sources", || async {
             self.writable
-                .load_dynamic_data_sources(self.site.deployment.clone(), block)
+                .load_dynamic_data_sources(
+                    self.site.cheap_clone(),
+                    block,
+                    manifest_idx_and_name.clone(),
+                )
                 .await
         })
         .await
@@ -346,9 +352,9 @@ impl SyncStore {
         self.site.shard.as_str()
     }
 
-    async fn health(&self, id: &DeploymentHash) -> Result<schema::SubgraphHealth, StoreError> {
+    async fn health(&self) -> Result<schema::SubgraphHealth, StoreError> {
         self.retry_async("health", || async {
-            self.writable.health(id).await.map(Into::into)
+            self.writable.health(&self.site).await.map(Into::into)
         })
         .await
     }
@@ -394,6 +400,7 @@ impl BlockTracker {
                 self.revert = self.revert.min(block_ptr.number);
                 self.block = self.block.min(block_ptr.number);
             }
+            Request::Stop => { /* do nothing */ }
         }
     }
 
@@ -419,21 +426,29 @@ enum Request {
         stopwatch: StopwatchMetrics,
         /// The block at which we are writing the changes
         block_ptr: BlockPtr,
-        firehose_cursor: Option<String>,
+        firehose_cursor: FirehoseCursor,
         mods: Vec<EntityModification>,
         data_sources: Vec<StoredDynamicDataSource>,
         deterministic_errors: Vec<SubgraphError>,
+        manifest_idx_and_name: Vec<(u32, String)>,
+        processed_data_sources: Vec<StoredDynamicDataSource>,
     },
     RevertTo {
         store: Arc<SyncStore>,
         /// The subgraph head will be at this block pointer after the revert
         block_ptr: BlockPtr,
-        firehose_cursor: Option<String>,
+        firehose_cursor: FirehoseCursor,
     },
+    Stop,
+}
+
+enum ExecResult {
+    Continue,
+    Stop,
 }
 
 impl Request {
-    fn execute(&self) -> Result<(), StoreError> {
+    fn execute(&self) -> Result<ExecResult, StoreError> {
         match self {
             Request::Write {
                 store,
@@ -443,19 +458,28 @@ impl Request {
                 mods,
                 data_sources,
                 deterministic_errors,
-            } => store.transact_block_operations(
-                block_ptr_to,
-                firehose_cursor.as_deref(),
-                mods,
-                stopwatch,
-                data_sources,
-                deterministic_errors,
-            ),
+                manifest_idx_and_name,
+                processed_data_sources,
+            } => store
+                .transact_block_operations(
+                    block_ptr_to,
+                    firehose_cursor,
+                    mods,
+                    stopwatch,
+                    data_sources,
+                    deterministic_errors,
+                    manifest_idx_and_name,
+                    processed_data_sources,
+                )
+                .map(|()| ExecResult::Continue),
             Request::RevertTo {
                 store,
                 block_ptr,
                 firehose_cursor,
-            } => store.revert_block_operations(block_ptr.clone(), firehose_cursor.as_deref()),
+            } => store
+                .revert_block_operations(block_ptr.clone(), firehose_cursor)
+                .map(|()| ExecResult::Continue),
+            Request::Stop => return Ok(ExecResult::Stop),
         }
     }
 }
@@ -534,14 +558,28 @@ impl Queue {
                 // these methods would not be able to see that data until
                 // the write transaction commits, causing them to return
                 // incorrect results.
-                let req = queue.queue.peek().await;
-                let res = graph::spawn_blocking_allow_panic(move || req.execute()).await;
+                let req = {
+                    let _section = queue.stopwatch.start_section("queue_wait");
+                    queue.queue.peek().await
+                };
+                let res = {
+                    let _section = queue.stopwatch.start_section("queue_execute");
+                    graph::spawn_blocking_allow_panic(move || req.execute()).await
+                };
 
+                let _section = queue.stopwatch.start_section("queue_pop");
+                use ExecResult::*;
                 match res {
-                    Ok(Ok(())) => {
+                    Ok(Ok(Continue)) => {
                         // The request has been handled. It's now safe to remove it
                         // from the queue
                         queue.queue.pop().await;
+                    }
+                    Ok(Ok(Stop)) => {
+                        // Graceful shutdown. We also handled the request
+                        // successfully
+                        queue.queue.pop().await;
+                        return;
                     }
                     Ok(Err(e)) => {
                         error!(logger, "Subgraph writer failed"; "error" => e.to_string());
@@ -597,6 +635,10 @@ impl Queue {
         self.check_err()
     }
 
+    async fn stop(&self) -> Result<(), StoreError> {
+        self.push(Request::Stop).await
+    }
+
     fn check_err(&self) -> Result<(), StoreError> {
         if let Some(err) = self.write_err.lock().unwrap().take() {
             return Err(err);
@@ -639,7 +681,7 @@ impl Queue {
                 } => {
                     if tracker.visible(block_ptr) {
                         mods.iter()
-                            .find(|emod| emod.entity_key() == key)
+                            .find(|emod| emod.entity_ref() == key)
                             .map(|emod| match emod {
                                 EntityModification::Insert { data, .. }
                                 | EntityModification::Overwrite { data, .. } => {
@@ -651,7 +693,7 @@ impl Queue {
                         None
                     }
                 }
-                Request::RevertTo { .. } => None,
+                Request::RevertTo { .. } | Request::Stop => None,
             }
         });
 
@@ -681,10 +723,10 @@ impl Queue {
                     } => {
                         if tracker.visible(block_ptr) {
                             for emod in mods {
-                                let key = emod.entity_key();
+                                let key = emod.entity_ref();
                                 if let Some(ids) = ids_for_type.get_mut(&key.entity_type) {
                                     if let Some(idx) =
-                                        ids.iter().position(|id| *id == &key.entity_id)
+                                        ids.iter().position(|id| *id == key.entity_id.as_str())
                                     {
                                         // We are looking for the entity
                                         // underlying this modification. Add
@@ -706,7 +748,7 @@ impl Queue {
                             }
                         }
                     }
-                    Request::RevertTo { .. } => { /* nothing to do */ }
+                    Request::RevertTo { .. } | Request::Stop => { /* nothing to do */ }
                 }
                 map
             },
@@ -730,7 +772,10 @@ impl Queue {
     }
 
     /// Load dynamic data sources by looking at both the queue and the store
-    async fn load_dynamic_data_sources(&self) -> Result<Vec<StoredDynamicDataSource>, StoreError> {
+    async fn load_dynamic_data_sources(
+        &self,
+        manifest_idx_and_name: Vec<(u32, String)>,
+    ) -> Result<Vec<StoredDynamicDataSource>, StoreError> {
         // See the implementation of `get` for how we handle reverts
         let mut tracker = BlockTracker::new();
 
@@ -746,13 +791,18 @@ impl Queue {
                 Request::Write {
                     block_ptr,
                     data_sources,
+                    processed_data_sources,
                     ..
                 } => {
                     if tracker.visible(block_ptr) {
                         dds.extend(data_sources.clone());
+                        dds = dds
+                            .into_iter()
+                            .filter(|dds| !processed_data_sources.contains(dds))
+                            .collect();
                     }
                 }
-                Request::RevertTo { .. } => { /* nothing to do */ }
+                Request::RevertTo { .. } | Request::Stop => { /* nothing to do */ }
             }
             dds
         });
@@ -764,11 +814,15 @@ impl Queue {
 
         let mut dds = self
             .store
-            .load_dynamic_data_sources(tracker.query_block())
+            .load_dynamic_data_sources(tracker.query_block(), manifest_idx_and_name)
             .await?;
         dds.append(&mut queue_dds);
 
         Ok(dds)
+    }
+
+    fn poisoned(&self) -> bool {
+        self.poisoned.load(Ordering::SeqCst)
     }
 }
 
@@ -796,20 +850,24 @@ impl Writer {
     async fn write(
         &self,
         block_ptr_to: BlockPtr,
-        firehose_cursor: Option<String>,
+        firehose_cursor: FirehoseCursor,
         mods: Vec<EntityModification>,
         stopwatch: &StopwatchMetrics,
         data_sources: Vec<StoredDynamicDataSource>,
         deterministic_errors: Vec<SubgraphError>,
+        manifest_idx_and_name: Vec<(u32, String)>,
+        processed_data_sources: Vec<StoredDynamicDataSource>,
     ) -> Result<(), StoreError> {
         match self {
             Writer::Sync(store) => store.transact_block_operations(
                 &block_ptr_to,
-                firehose_cursor.as_deref(),
+                &firehose_cursor,
                 &mods,
                 &stopwatch,
                 &data_sources,
                 &deterministic_errors,
+                &manifest_idx_and_name,
+                &processed_data_sources,
             ),
             Writer::Async(queue) => {
                 let req = Request::Write {
@@ -820,6 +878,8 @@ impl Writer {
                     mods,
                     data_sources,
                     deterministic_errors,
+                    manifest_idx_and_name,
+                    processed_data_sources,
                 };
                 queue.push(req).await
             }
@@ -829,12 +889,11 @@ impl Writer {
     async fn revert(
         &self,
         block_ptr_to: BlockPtr,
-        firehose_cursor: Option<&str>,
+        firehose_cursor: FirehoseCursor,
     ) -> Result<(), StoreError> {
         match self {
-            Writer::Sync(store) => store.revert_block_operations(block_ptr_to, firehose_cursor),
+            Writer::Sync(store) => store.revert_block_operations(block_ptr_to, &firehose_cursor),
             Writer::Async(queue) => {
-                let firehose_cursor = firehose_cursor.map(|c| c.to_string());
                 let req = Request::RevertTo {
                     store: queue.store.cheap_clone(),
                     block_ptr: block_ptr_to,
@@ -869,10 +928,31 @@ impl Writer {
         }
     }
 
-    async fn load_dynamic_data_sources(&self) -> Result<Vec<StoredDynamicDataSource>, StoreError> {
+    async fn load_dynamic_data_sources(
+        &self,
+        manifest_idx_and_name: Vec<(u32, String)>,
+    ) -> Result<Vec<StoredDynamicDataSource>, StoreError> {
         match self {
-            Writer::Sync(store) => store.load_dynamic_data_sources(BLOCK_NUMBER_MAX).await,
-            Writer::Async(queue) => queue.load_dynamic_data_sources().await,
+            Writer::Sync(store) => {
+                store
+                    .load_dynamic_data_sources(BLOCK_NUMBER_MAX, manifest_idx_and_name)
+                    .await
+            }
+            Writer::Async(queue) => queue.load_dynamic_data_sources(manifest_idx_and_name).await,
+        }
+    }
+
+    fn poisoned(&self) -> bool {
+        match self {
+            Writer::Sync(_) => false,
+            Writer::Async(queue) => queue.poisoned(),
+        }
+    }
+
+    async fn stop(&self) -> Result<(), StoreError> {
+        match self {
+            Writer::Sync(_) => Ok(()),
+            Writer::Async(queue) => queue.stop().await,
         }
     }
 }
@@ -880,7 +960,7 @@ impl Writer {
 pub struct WritableStore {
     store: Arc<SyncStore>,
     block_ptr: Mutex<Option<BlockPtr>>,
-    block_cursor: Mutex<Option<String>>,
+    block_cursor: Mutex<FirehoseCursor>,
     writer: Writer,
 }
 
@@ -908,22 +988,41 @@ impl WritableStore {
             writer,
         })
     }
+
+    pub(crate) fn poisoned(&self) -> bool {
+        self.writer.poisoned()
+    }
+
+    pub(crate) async fn stop(&self) -> Result<(), StoreError> {
+        self.writer.stop().await
+    }
+}
+
+impl ReadStore for WritableStore {
+    fn get(&self, key: &EntityKey) -> Result<Option<Entity>, StoreError> {
+        self.writer.get(key)
+    }
+
+    fn get_many(
+        &self,
+        ids_for_type: BTreeMap<&EntityType, Vec<&str>>,
+    ) -> Result<BTreeMap<EntityType, Vec<Entity>>, StoreError> {
+        self.writer.get_many(ids_for_type)
+    }
+
+    fn input_schema(&self) -> Arc<Schema> {
+        self.store.input_schema()
+    }
 }
 
 #[async_trait::async_trait]
 impl WritableStoreTrait for WritableStore {
-    async fn block_ptr(&self) -> Option<BlockPtr> {
+    fn block_ptr(&self) -> Option<BlockPtr> {
         self.block_ptr.lock().unwrap().clone()
     }
 
-    async fn block_cursor(&self) -> Option<String> {
+    fn block_cursor(&self) -> FirehoseCursor {
         self.block_cursor.lock().unwrap().clone()
-    }
-
-    async fn delete_block_cursor(&self) -> Result<(), StoreError> {
-        self.store.delete_block_cursor().await?;
-        *self.block_cursor.lock().unwrap() = None;
-        Ok(())
     }
 
     async fn start_subgraph_deployment(&self, logger: &Logger) -> Result<(), StoreError> {
@@ -943,15 +1042,15 @@ impl WritableStoreTrait for WritableStore {
     async fn revert_block_operations(
         &self,
         block_ptr_to: BlockPtr,
-        firehose_cursor: Option<&str>,
+        firehose_cursor: FirehoseCursor,
     ) -> Result<(), StoreError> {
         *self.block_ptr.lock().unwrap() = Some(block_ptr_to.clone());
-        *self.block_cursor.lock().unwrap() = firehose_cursor.map(|c| c.to_string());
+        *self.block_cursor.lock().unwrap() = firehose_cursor.clone();
 
         self.writer.revert(block_ptr_to, firehose_cursor).await
     }
 
-    fn unfail_deterministic_error(
+    async fn unfail_deterministic_error(
         &self,
         current_ptr: &BlockPtr,
         parent_ptr: &BlockPtr,
@@ -961,7 +1060,8 @@ impl WritableStoreTrait for WritableStore {
             .unfail_deterministic_error(current_ptr, parent_ptr)?;
 
         if let UnfailOutcome::Unfailed = outcome {
-            *self.block_ptr.lock().unwrap() = Some(parent_ptr.clone());
+            *self.block_ptr.lock().unwrap() = self.store.block_ptr().await?;
+            *self.block_cursor.lock().unwrap() = self.store.block_cursor().await?;
         }
 
         Ok(outcome)
@@ -985,18 +1085,16 @@ impl WritableStoreTrait for WritableStore {
         self.store.supports_proof_of_indexing().await
     }
 
-    fn get(&self, key: &EntityKey) -> Result<Option<Entity>, StoreError> {
-        self.writer.get(key)
-    }
-
     async fn transact_block_operations(
         &self,
         block_ptr_to: BlockPtr,
-        firehose_cursor: Option<String>,
+        firehose_cursor: FirehoseCursor,
         mods: Vec<EntityModification>,
         stopwatch: &StopwatchMetrics,
         data_sources: Vec<StoredDynamicDataSource>,
         deterministic_errors: Vec<SubgraphError>,
+        manifest_idx_and_name: Vec<(u32, String)>,
+        processed_data_sources: Vec<StoredDynamicDataSource>,
     ) -> Result<(), StoreError> {
         self.writer
             .write(
@@ -1006,6 +1104,8 @@ impl WritableStoreTrait for WritableStore {
                 stopwatch,
                 data_sources,
                 deterministic_errors,
+                manifest_idx_and_name,
+                processed_data_sources,
             )
             .await?;
 
@@ -1013,13 +1113,6 @@ impl WritableStoreTrait for WritableStore {
         *self.block_cursor.lock().unwrap() = firehose_cursor;
 
         Ok(())
-    }
-
-    fn get_many(
-        &self,
-        ids_for_type: BTreeMap<&EntityType, Vec<&str>>,
-    ) -> Result<BTreeMap<EntityType, Vec<Entity>>, StoreError> {
-        self.writer.get_many(ids_for_type)
     }
 
     fn deployment_synced(&self) -> Result<(), StoreError> {
@@ -1034,20 +1127,21 @@ impl WritableStoreTrait for WritableStore {
         self.store.unassign_subgraph()
     }
 
-    async fn load_dynamic_data_sources(&self) -> Result<Vec<StoredDynamicDataSource>, StoreError> {
-        self.writer.load_dynamic_data_sources().await
+    async fn load_dynamic_data_sources(
+        &self,
+        manifest_idx_and_name: Vec<(u32, String)>,
+    ) -> Result<Vec<StoredDynamicDataSource>, StoreError> {
+        self.writer
+            .load_dynamic_data_sources(manifest_idx_and_name)
+            .await
     }
 
     fn shard(&self) -> &str {
         self.store.shard()
     }
 
-    async fn health(&self, id: &DeploymentHash) -> Result<schema::SubgraphHealth, StoreError> {
-        self.store.health(id).await
-    }
-
-    fn input_schema(&self) -> Arc<Schema> {
-        self.store.input_schema()
+    async fn health(&self) -> Result<schema::SubgraphHealth, StoreError> {
+        self.store.health().await
     }
 
     async fn flush(&self) -> Result<(), StoreError> {

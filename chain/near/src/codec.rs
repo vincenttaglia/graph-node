@@ -1,5 +1,6 @@
+#[rustfmt::skip]
 #[path = "protobuf/sf.near.codec.v1.rs"]
-mod pbcodec;
+pub mod pbcodec;
 
 use graph::{
     blockchain::Block as BlockchainBlock,

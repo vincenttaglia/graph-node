@@ -10,13 +10,19 @@
 mod ddl;
 
 #[cfg(test)]
-mod tests;
+mod ddl_tests;
+#[cfg(test)]
+mod query_tests;
+
+mod prune;
 
 use diesel::{connection::SimpleConnection, Connection};
 use diesel::{debug_query, OptionalExtension, PgConnection, RunQueryDsl};
 use graph::cheap_clone::CheapClone;
 use graph::constraint_violation;
 use graph::data::graphql::TypeExt as _;
+use graph::data::query::Trace;
+use graph::data::value::Word;
 use graph::prelude::{q, s, StopwatchMetrics, ENV_VARS};
 use graph::slog::warn;
 use inflector::Inflector;
@@ -37,15 +43,15 @@ use crate::{
         FilterQuery, FindManyQuery, FindQuery, InsertQuery, RevertClampQuery, RevertRemoveQuery,
     },
 };
-use graph::components::store::EntityType;
+use graph::components::store::{EntityKey, EntityType};
 use graph::data::graphql::ext::{DirectiveFinder, DocumentExt, ObjectTypeExt};
 use graph::data::schema::{FulltextConfig, FulltextDefinition, Schema, SCHEMA_TYPE_NAME};
 use graph::data::store::BYTES_SCALAR;
 use graph::data::subgraph::schema::{POI_OBJECT, POI_TABLE};
 use graph::prelude::{
     anyhow, info, BlockNumber, DeploymentHash, Entity, EntityChange, EntityCollection,
-    EntityFilter, EntityKey, EntityOperation, EntityOrder, EntityRange, Logger,
-    QueryExecutionError, StoreError, StoreEvent, ValueType, BLOCK_NUMBER_MAX,
+    EntityFilter, EntityOperation, EntityOrder, EntityRange, Logger, QueryExecutionError,
+    StoreError, StoreEvent, ValueType, BLOCK_NUMBER_MAX,
 };
 
 use crate::block_range::{BLOCK_COLUMN, BLOCK_RANGE_COLUMN};
@@ -164,6 +170,15 @@ pub(crate) enum IdType {
     Bytes,
 }
 
+impl IdType {
+    pub fn sql_type(&self) -> &str {
+        match self {
+            IdType::String => "text",
+            IdType::Bytes => "bytea",
+        }
+    }
+}
+
 impl TryFrom<&s::ObjectType> for IdType {
     type Error = StoreError;
 
@@ -215,7 +230,7 @@ pub struct Layout {
 impl Layout {
     /// Generate a layout for a relational schema for entities in the
     /// GraphQL schema `schema`. The name of the database schema in which
-    /// the subgraph's tables live is in `schema`.
+    /// the subgraph's tables live is in `site`.
     pub fn new(site: Arc<Site>, schema: &Schema, catalog: Catalog) -> Result<Self, StoreError> {
         // Extract enum types
         let enums: EnumMap = schema
@@ -472,7 +487,7 @@ impl Layout {
         FindQuery::new(table.as_ref(), id, block)
             .get_result::<EntityData>(conn)
             .optional()?
-            .map(|entity_data| entity_data.deserialize_with_layout(self))
+            .map(|entity_data| entity_data.deserialize_with_layout(self, None, true))
             .transpose()
     }
 
@@ -498,10 +513,13 @@ impl Layout {
         };
         let mut entities_for_type: BTreeMap<EntityType, Vec<Entity>> = BTreeMap::new();
         for data in query.load::<EntityData>(conn)? {
+            let entity_type = data.entity_type();
+            let entity_data: Entity = data.deserialize_with_layout(self, None, true)?;
+
             entities_for_type
-                .entry(data.entity_type())
+                .entry(entity_type)
                 .or_default()
-                .push(data.deserialize_with_layout(self)?);
+                .push(entity_data);
         }
         Ok(entities_for_type)
     }
@@ -530,8 +548,8 @@ impl Layout {
 
         for entity_data in inserts_or_updates.into_iter() {
             let entity_type = entity_data.entity_type();
-            let mut data: Entity = entity_data.deserialize_with_layout(self)?;
-            let entity_id = data.id().expect("Invalid ID for entity.");
+            let mut data: Entity = entity_data.deserialize_with_layout(self, None, false)?;
+            let entity_id = Word::from(data.id().expect("Invalid ID for entity."));
             processed_entities.insert((entity_type.clone(), entity_id.clone()));
 
             // `__typename` is not a real field.
@@ -540,7 +558,6 @@ impl Layout {
 
             changes.push(EntityOperation::Set {
                 key: EntityKey {
-                    subgraph_id: self.site.deployment.cheap_clone(),
                     entity_type,
                     entity_id,
                 },
@@ -550,14 +567,13 @@ impl Layout {
 
         for del in &deletions {
             let entity_type = del.entity_type();
-            let entity_id = del.id().to_string();
+            let entity_id = Word::from(del.id());
 
             // See the doc comment of `FindPossibleDeletionsQuery` for details
             // about why this check is necessary.
             if !processed_entities.contains(&(entity_type.clone(), entity_id.clone())) {
                 changes.push(EntityOperation::Remove {
                     key: EntityKey {
-                        subgraph_id: self.site.deployment.cheap_clone(),
                         entity_type,
                         entity_id,
                     },
@@ -615,21 +631,23 @@ impl Layout {
         range: EntityRange,
         block: BlockNumber,
         query_id: Option<String>,
-    ) -> Result<Vec<T>, QueryExecutionError> {
+    ) -> Result<(Vec<T>, Trace), QueryExecutionError> {
         fn log_query_timing(
             logger: &Logger,
             query: &FilterQuery,
             elapsed: Duration,
             entity_count: usize,
-        ) {
+        ) -> Trace {
             // 20kB
             const MAXLEN: usize = 20_480;
 
             if !ENV_VARS.log_sql_timing() {
-                return;
+                return Trace::None;
             }
 
             let mut text = debug_query(&query).to_string().replace("\n", "\t");
+            let trace = Trace::query(&text, elapsed, entity_count);
+
             // If the query + bind variables is more than MAXLEN, truncate it;
             // this will happen when queries have very large bind variables
             // (e.g., long arrays of string ids)
@@ -644,9 +662,10 @@ impl Layout {
                 "time_ms" => elapsed.as_millis(),
                 "entity_count" => entity_count
             );
+            trace
         }
 
-        let filter_collection = FilterCollection::new(self, collection, filter.as_ref())?;
+        let filter_collection = FilterCollection::new(self, collection, filter.as_ref(), block)?;
         let query = FilterQuery::new(
             &filter_collection,
             filter.as_ref(),
@@ -654,6 +673,7 @@ impl Layout {
             range,
             block,
             query_id,
+            &self.site,
         )?;
         let query_clone = query.clone();
 
@@ -665,31 +685,44 @@ impl Layout {
                 }
                 query.load::<EntityData>(conn)
             })
-            .map_err(|e| match e {
-                diesel::result::Error::DatabaseError(
-                    diesel::result::DatabaseErrorKind::__Unknown,
-                    ref info,
-                ) if info.message().starts_with("syntax error in tsquery") => {
-                    QueryExecutionError::FulltextQueryInvalidSyntax(info.message().to_string())
+            .map_err(|e| {
+                use diesel::result::DatabaseErrorKind;
+                use diesel::result::Error::*;
+                // Sometimes `debug_query(..)` can't be turned into a
+                // string, e.g., because `walk_ast` for one of its fragments
+                // returns an error. When that happens, avoid a panic from
+                // simply calling `to_string()` on it, and output a string
+                // representation of the `FilterQuery` instead of the SQL
+                let mut query_text = String::new();
+                match write!(query_text, "{}", debug_query(&query_clone)) {
+                    Ok(()) => (),
+                    Err(_) => {
+                        write!(query_text, "{query_clone}").ok();
+                    }
+                };
+                match e {
+                    DatabaseError(DatabaseErrorKind::__Unknown, ref info)
+                        if info.message().starts_with("syntax error in tsquery") =>
+                    {
+                        QueryExecutionError::FulltextQueryInvalidSyntax(info.message().to_string())
+                    }
+                    _ => QueryExecutionError::ResolveEntitiesError(format!(
+                        "{e}, query = {query_text}",
+                    )),
                 }
-                diesel::result::Error::QueryBuilderError(e) => {
-                    QueryExecutionError::ResolveEntitiesError(e.to_string())
-                }
-                _ => QueryExecutionError::ResolveEntitiesError(format!(
-                    "{}, query = {}",
-                    e,
-                    debug_query(&query_clone).to_string()
-                )),
             })?;
-        log_query_timing(logger, &query_clone, start.elapsed(), values.len());
+        let trace = log_query_timing(logger, &query_clone, start.elapsed(), values.len());
+
+        let parent_type = filter_collection.parent_type()?.map(ColumnType::from);
         values
             .into_iter()
             .map(|entity_data| {
                 entity_data
-                    .deserialize_with_layout(self)
+                    .deserialize_with_layout(self, parent_type.as_ref(), false)
                     .map_err(|e| e.into())
             })
-            .collect()
+            .collect::<Result<Vec<T>, _>>()
+            .map(|values| (values, trace))
     }
 
     pub fn update<'a>(
@@ -827,11 +860,11 @@ impl Layout {
     /// is subject to reversion is only ever created but never updated
     pub fn revert_metadata(
         conn: &PgConnection,
-        subgraph: &DeploymentHash,
+        site: &Site,
         block: BlockNumber,
     ) -> Result<(), StoreError> {
-        crate::dynds::revert(conn, subgraph, block)?;
-        crate::deployment::revert_subgraph_errors(conn, subgraph, block)?;
+        crate::dynds::revert(conn, site, block)?;
+        crate::deployment::revert_subgraph_errors(conn, &site.deployment, block)?;
 
         Ok(())
     }
@@ -852,15 +885,7 @@ impl Layout {
         site: Arc<Site>,
     ) -> Result<Arc<Self>, StoreError> {
         let account_like = crate::catalog::account_like(conn, &self.site)?;
-        let is_account_like = {
-            |table: &Table| {
-                ENV_VARS
-                    .store
-                    .account_tables
-                    .contains(table.qualified_name.as_str())
-                    || account_like.contains(table.name.as_str())
-            }
-        };
+        let is_account_like = { |table: &Table| account_like.contains(table.name.as_str()) };
 
         let changed_tables: Vec<_> = self
             .tables
@@ -1052,6 +1077,7 @@ impl Column {
         // generation needs to match how these columns are indexed, and we
         // therefore use that remembered value from `catalog` to determine
         // if we should use queries for prefixes or for the entire value.
+        // see: attr-bytea-prefix
         let use_prefix_comparison = !is_primary_key
             && !is_reference
             && !field.field_type.is_list()
@@ -1203,23 +1229,37 @@ impl Table {
             .chain(fulltexts.iter().map(Column::new_fulltext))
             .collect::<Result<Vec<Column>, StoreError>>()?;
         let qualified_name = SqlName::qualified_name(&catalog.site.namespace, &table_name);
-        let is_account_like = ENV_VARS
-            .store
-            .account_tables
-            .contains(qualified_name.as_str());
-
         let immutable = defn.is_immutable();
 
         let table = Table {
             object: EntityType::from(defn),
             name: table_name,
             qualified_name,
-            is_account_like,
+            // Default `is_account_like` to `false`; the caller should call
+            // `refresh` after constructing the layout, but that requires a
+            // db connection, which we don't have at this point.
+            is_account_like: false,
             columns,
             position,
             immutable,
         };
         Ok(table)
+    }
+
+    /// Create a table that is like `self` except that its name in the
+    /// database is based on `namespace` and `name`
+    pub fn new_like(&self, namespace: &Namespace, name: &SqlName) -> Arc<Table> {
+        let other = Table {
+            object: self.object.clone(),
+            name: name.clone(),
+            qualified_name: SqlName::qualified_name(namespace, &name),
+            columns: self.columns.clone(),
+            is_account_like: self.is_account_like,
+            position: self.position,
+            immutable: self.immutable,
+        };
+
+        Arc::new(other)
     }
 
     /// Find the column `name` in this table. The name must be in snake case,
@@ -1268,6 +1308,13 @@ impl Table {
             .iter()
             .find(|column| column.is_primary_key())
             .expect("every table has a primary key")
+    }
+
+    pub(crate) fn analyze(&self, conn: &PgConnection) -> Result<(), StoreError> {
+        let table_name = &self.qualified_name;
+        let sql = format!("analyze {table_name}");
+        conn.execute(&sql)?;
+        Ok(())
     }
 }
 
@@ -1396,6 +1443,14 @@ impl LayoutCache {
                 Ok(layout)
             }
         }
+    }
+
+    pub(crate) fn remove(&self, site: &Site) -> Option<Arc<Layout>> {
+        self.entries
+            .lock()
+            .unwrap()
+            .remove(&site.deployment)
+            .map(|CacheEntry { value, expires: _ }| value.clone())
     }
 
     // Only needed for tests
